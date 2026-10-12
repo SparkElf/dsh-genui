@@ -23,7 +23,7 @@ body[data-ds-dark-theme] .block,
 body[data-ds-dark-theme] .panel {
   --dsl-g-surface: color-mix(in srgb, var(--dsw-alias-label-primary) 4%,
     var(--dsw-alias-bg-layer-2, var(--dsw-alias-bg-layer-1, var(--dsw-alias-markdown-code-block, transparent))));
-  --dsl-g-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.24), 0 8px 24px rgba(0, 0, 0, 0.18);
+  --dsl-g-shadow-card: none;
 }
 
 .block,
@@ -91,8 +91,8 @@ body[data-ds-dark-theme] .panel {
   /* Borders separate, shadows lift (design standard: "shadows over borders"):
      the outline stays quiet and the layered shadow carries the depth, with the
      first layer at the documented minimum `0 1px 3px rgba(0,0,0,0.10)`. */
-  --dsl-g-border-surface: color-mix(in srgb, var(--dsw-alias-label-primary) 12%, transparent);
-  --dsl-g-shadow-card: 0 1px 3px rgba(0, 0, 0, 0.10), 0 8px 24px rgba(0, 0, 0, 0.06);
+  --dsl-g-border-surface: color-mix(in srgb, var(--dsw-alias-label-primary) 8%, transparent);
+  --dsl-g-shadow-card: none;
 }
 
 .block {
@@ -379,7 +379,6 @@ img.mediaPlayer { aspect-ratio: 16 / 9; object-fit: cover; background: var(--dsl
   font-size: var(--dsl-g-font-meta);
   font-weight: 700;
   letter-spacing: 0.1em;
-  text-transform: uppercase;
   color: var(--dsw-alias-label-secondary);
 }
 .heroTop { display: flex; align-items: baseline; gap: var(--dsl-g-gap-md); flex-wrap: wrap; }
@@ -483,7 +482,6 @@ img.mediaPlayer { aspect-ratio: 16 / 9; object-fit: cover; background: var(--dsl
   font-size: var(--dsl-g-font-meta);
   color: var(--dsw-alias-label-secondary);
   letter-spacing: 0.05em;
-  text-transform: uppercase;
   line-height: 1.4;
 }
 .statValue {
@@ -583,10 +581,8 @@ img.mediaPlayer { aspect-ratio: 16 / 9; object-fit: cover; background: var(--dsl
 .liDesc { font-size: var(--dsl-g-font-meta); color: var(--dsw-alias-label-secondary); line-height: 1.55; }
 
 .tableWrap {
-  border-radius: var(--dsl-g-radius-control);
-  border: 1px solid var(--dsl-g-border-surface);
-  /* A table whose nowrap cells exceed the column width must scroll, not clip
-     (mirrors the shell markdown table's .tableScroll pattern). */
+  /* The rows already carry hairlines; an outline around them would add a second, heavier
+     boundary. Scrolling stays so a wide table does not clip its columns. */
   overflow-x: auto;
   overscroll-behavior-x: contain;
   max-width: 100%;
@@ -599,8 +595,6 @@ img.mediaPlayer { aspect-ratio: 16 / 9; object-fit: cover; background: var(--dsl
   color: var(--dsw-alias-label-secondary);
   font-weight: 700;
   font-size: var(--dsl-g-font-meta);
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
   border-bottom: 1px solid var(--dsl-g-border-strong);
   background: var(--dsl-g-zebra);
   white-space: nowrap;
