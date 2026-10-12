@@ -11,7 +11,7 @@ const embeddedFallbacks = fontFallbacks.filter(value => bundle.includes(value))
 if (embeddedFallbacks.length > 0) throw new Error(`standalone runtime contains redundant font formats: ${embeddedFallbacks.join(', ')}`)
 const forbidden = [
   'window.__ModuleLoader__',
-  '/plugins/@changfenhuang/dsh-genui',
+  '/plugins/@sparkelf/dsh-genui',
   'conversation.send',
   '@deepseek-ai/dsh-client-ui-primitives',
 ]

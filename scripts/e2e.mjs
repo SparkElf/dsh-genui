@@ -120,7 +120,7 @@ try {
   // ── 安装插件 ────────────────────────────────────────────────────────────
   if (INSTALL === 'npm') {
     log('安装插件（npm 公开包）...')
-    const r = spawnSync(DSH_BIN, ['plugin', '--profile', 'web', 'add', '@changfenhuang/dsh-genui'], { env, stdio: 'inherit' })
+    const r = spawnSync(DSH_BIN, ['plugin', '--profile', 'web', 'add', '@sparkelf/dsh-genui'], { env, stdio: 'inherit' })
     if (r.status !== 0) fail('npm 安装失败（见上方输出）')
   } else if (INSTALL === 'tarball') {
     log(`安装插件（tarball ${TARBALL}）...`)
@@ -194,13 +194,13 @@ try {
   const boot = await page.evaluate(() => {
     const boot = window.__DSH_BOOT__
     if (boot === null || typeof boot !== 'object' || !Array.isArray(boot.entries)) return undefined
-    return { entries: boot.entries.length, clientUrl: boot.entries.find(entry => entry.id === '@changfenhuang/dsh-genui')?.url }
+    return { entries: boot.entries.length, clientUrl: boot.entries.find(entry => entry.id === '@sparkelf/dsh-genui')?.url }
   })
   if (boot?.entries === 0) {
     await page.screenshot({ path: join(artifactsDir, 'e2e-fail-empty-host-boot.png') })
     fail('dsh 宿主启动图为空（连内置浏览器插件都未注册）')
   }
-  const clientUrl = boot?.clientUrl ?? '/plugins/@changfenhuang/dsh-genui/client.js'
+  const clientUrl = boot?.clientUrl ?? '/plugins/@sparkelf/dsh-genui/client.js'
   const clientRes = await fetch(new URL(clientUrl, readyUrl))
   if (!clientRes.ok) {
     await page.screenshot({ path: join(artifactsDir, 'e2e-fail-client404.png') })
