@@ -7,9 +7,17 @@
  * via env (tuning), never silently widened.
  */
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { parseArgs } from 'node:util'
+
+const { values: options } = parseArgs({
+  options: { keep: { type: 'boolean', default: false } },
+  strict: true,
+})
 
 const MAX_TARBALL = Number(process.env.GENUI_PACK_MAX_TARBALL ?? 3 * 1024 * 1024)
 const MAX_UNPACKED = Number(process.env.GENUI_PACK_MAX_UNPACKED ?? 10 * 1024 * 1024)
@@ -31,14 +39,17 @@ for (const entry of Object.values(pkgJson.exports)) {
 // engine assets the node-half route serves to the browser on demand.
 const required = [
   'package.json', 'LICENSE', 'SKILL.md', 'README.md', 'CHANGELOG.md', 'demo-prompts.md', 'cordis.patch.yml',
-  'lib/assets/mermaid.js', 'lib/assets/three.js', 'lib/assets/echarts.js',
+  'lib/assets/mermaid.js', 'lib/assets/three.js',
+  // ECharts ships as two bundles: core (common presets) + full (the rest).
+  'lib/assets/echarts-core.js', 'lib/assets/echarts-full.js',
   // plugin_check 发布规范（issue #15）：tarball 必须携带可复现构建所需的
   // 源码入口与构建配置，prepack 已在打包前重建 lib。
   'src/index.ts', 'tsconfig.json', 'tsdown.config.ts',
   ...exportTargets,
 ]
 
-const dir = mkdtempSync(join(tmpdir(), 'genui-pack-'))
+const dir = mkdtempSync(join(tmpdir(), 'dsh-genui-pack-'))
+let keepTarball = false
 try {
   const out = execFileSync('npm', ['pack', '--pack-destination', dir, '--json'], {
     encoding: 'utf8',
@@ -47,12 +58,10 @@ try {
   const [packed] = JSON.parse(out)
   const paths = new Set(packed.files.map(f => f.path))
   // npm pack reports paths without the leading './' that exports use.
-  const at = (p) => (p.startsWith('./') ? p.slice(2) : p)
-
-  const missing = required.filter(p => !paths.has(at(p)))
+  const missing = required.filter(p => !paths.has(p.startsWith('./') ? p.slice(2) : p))
   if (missing.length > 0) {
     console.error(`verify-pack: FAIL — missing required entries: ${missing.join(', ')}`)
-    process.exit(1)
+    throw new Error('pack verification failed')
   }
 
   const forbidden = [...paths].filter(p =>
@@ -62,20 +71,28 @@ try {
   )
   if (forbidden.length > 0) {
     console.error(`verify-pack: FAIL — forbidden entries in pack:\n  ${forbidden.join('\n  ')}`)
-    process.exit(1)
+    throw new Error('pack verification failed')
   }
 
-  const tarballBytes = statSync(join(dir, packed.filename)).size
+  const tarballPath = resolve(dir, packed.filename)
+  const tarballBytes = statSync(tarballPath).size
   const problems = []
   if (tarballBytes > MAX_TARBALL) problems.push(`tarball ${tarballBytes} > ${MAX_TARBALL}`)
   if (packed.unpackedSize > MAX_UNPACKED) problems.push(`unpacked ${packed.unpackedSize} > ${MAX_UNPACKED}`)
   if (problems.length > 0) {
     console.error(`verify-pack: FAIL — ${problems.join('; ')}`)
-    process.exit(1)
+    throw new Error('pack verification failed')
   }
 
   console.log(`verify-pack: OK — ${packed.filename}`)
   console.log(`  tarball ${(tarballBytes / 1048576).toFixed(2)} MB (max ${(MAX_TARBALL / 1048576).toFixed(0)} MB), unpacked ${(packed.unpackedSize / 1048576).toFixed(2)} MB (max ${(MAX_UNPACKED / 1048576).toFixed(0)} MB), ${packed.entryCount} files`)
+  if (options.keep) {
+    const sha256 = createHash('sha256').update(readFileSync(tarballPath)).digest('hex')
+    if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `tarball=${tarballPath}\nsha256=${sha256}\n`)
+    console.log(`  tarball path ${tarballPath}`)
+    console.log(`  sha256 ${sha256}`)
+    keepTarball = true
+  }
 } finally {
-  rmSync(dir, { recursive: true, force: true })
+  if (!keepTarball) rmSync(dir, { recursive: true, force: true })
 }

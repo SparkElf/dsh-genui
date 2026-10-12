@@ -8,6 +8,7 @@
  * @module @changfenhuang/dsh-genui/client/echarts-lazy
  */
 import { loadGenuiAsset } from './asset-loader.ts'
+export { CORE_PRESETS } from './echarts-engine.ts'
 
 /** The ECharts instance surface (the subset the component uses). */
 export interface EChartsInstance {
@@ -29,7 +30,12 @@ interface EChartsAssetApi {
  * @param opts - optional height override.
  * @returns the ECharts instance (setOption/resize/dispose).
  */
-export async function createChart(el: HTMLElement, option: unknown, opts?: { height?: number }): Promise<EChartsInstance> {
-  const api = await loadGenuiAsset<EChartsAssetApi>('echarts')
+export async function createChart(
+  el: HTMLElement,
+  option: unknown,
+  opts?: { height?: number },
+  engine: 'core' | 'full' = 'core',
+): Promise<EChartsInstance> {
+  const api = await loadGenuiAsset<EChartsAssetApi>(engine === 'full' ? 'echarts-full' : 'echarts-core')
   return api.createChart(el, option, opts)
 }

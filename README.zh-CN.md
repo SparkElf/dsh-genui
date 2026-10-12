@@ -74,9 +74,12 @@ https://github.com/user-attachments/assets/f5db33ec-7471-4d4a-a85b-79c9962ab4ef
 本插件自带**两套渲染通道**；宿主激活浏览器模块后，插件会自动选择：
 
 - **Registry 通道**：宿主提供 `fence-registry` 扩展点（新版 dsh 构建）时，围栏经宿主流式渲染管线注册，行为与宿主无缝；
-- **DOM 通道**：宿主没有该扩展点（包括原版 DSH 与旧版构建）时，插件观察会话 DOM 自行挂载渲染树。自 0.7.2 起**支持流式渲染**：模型写到哪渲染到哪，首个完成的组件立即出现，不用等整段回复写完。自 0.8.3 起围栏发现**多表面兼容**：同时匹配标准 `md-code-block` 表面、部分宿主构建使用的 deepsuite 风格 `.code-block` / `.code-block-small` 表面，并以「label+`<pre>`」结构兜底——任何 banner 标注 `dsh-ui` 且含 `<pre>` 正文的元素都能被识别。即使你的 dsh 构建用了别的类名，围栏照常渲染（控制台会有一条一次性提示说明宿主 DOM 发生漂移）。
+- **DOM 通道**：宿主没有该扩展点（包括支持范围内的原版 DSH 构建）时，插件观察会话 DOM 自行挂载渲染树。自 0.7.2 起**支持流式渲染**：模型写到哪渲染到哪，首个完成的组件立即出现，不用等整段回复写完。自 0.8.3 起围栏发现**多表面兼容**：同时匹配标准 `md-code-block` 表面、部分宿主构建使用的 deepsuite 风格 `.code-block` / `.code-block-small` 表面，并以「label+`<pre>`」结构兜底——任何 banner 标注 `dsh-ui` 且含 `<pre>` 正文的元素都能被识别。即使你的 dsh 构建用了别的类名，围栏照常渲染（控制台会有一条一次性提示说明宿主 DOM 发生漂移）。
+- **DSH 0.1.7 通用代码块**：宿主最终 DOM 没有提供围栏 language metadata 时，dsh-genui 会从公开 ChatSnapshot 读取当前 assistant 的原始 Markdown，并且只接管 `dsh-ui` 围栏。DOM 负责确定挂载位置。source 数据暂时不可用时，assistant 已结束的通用 CodeBlock 才能通过严格的 canonical GenUI 规范校验进入最终兜底。
 
 无论走哪条通道，组件、交互、面板、持久化行为完全一致。
+
+CI 的 packed host smoke 会把实际生成的 npm tarball 安装到真实 DSH 宿主，并验证宿主启动与界面渲染。source-backed 围栏识别由 integration tests 覆盖；该 smoke 不代表真实模型回复验收。真实模型 E2E 需要配置模型凭据。
 
 本仓库已经包含两条渲染通道、服务端插件和浏览器构建产物；宿主仍负责**激活客户端模块**，并提供 `slots` 与 `sessions` 服务。`client.js` 返回 200 或出现在 ModuleLoader 缓存里，只能证明文件下载成功；真正激活后一定会打印 `[genui] client active; fence-channel=registry|dom`。没有这行时应先核对包名/网页配置/宿主激活链，`data-streaming`、`data-chat-anchor-key` 等页面属性只是可选信息，不是安装前提。
 
@@ -93,7 +96,7 @@ https://github.com/user-attachments/assets/f5db33ec-7471-4d4a-a85b-79c9962ab4ef
 
 前置条件，缺一不可：
 
-1. **dsh 已安装**（开源版任意构建均可——插件启动时自动选择渲染通道，见上文「双通道渲染」）
+1. **dsh `^0.1.2-rc.1 || ^0.1.5-alpha.1 || ^0.1.6-alpha.1 || ^0.1.7-alpha.1 || >=0.2.0-rc.1 <0.3.0-0`**（DSH `0.2.0-rc.1` 当前属于预发布版本；已验证宿主角色：minimum `dsh-v0.1.2-rc.1`、current `dsh-v0.1.7-rc.2`、next `dsh-v0.2.0-rc.2`；使用 DSH `<=0.1.1-rc.x` 的用户请使用 dsh-genui `0.9.8`）
 2. **`pnpm` 在 PATH 上**：`dsh plugin` 命令依赖它。没有就 `corepack enable`（或 `npm i -g pnpm`），然后**新开一个终端**，确认 `pnpm -v` 有输出
 
 安装并在 DSH 中激活（一行命令，自动带上全部依赖）：
@@ -112,6 +115,12 @@ npm install @changfenhuang/dsh-genui
 > `npm install` 只添加依赖，不会把插件注册到 DSH；在 DSH 中使用时仍应执行上面的 `dsh plugin add`。
 
 > ⚠️ **别用 `link:` 装一个刚 clone 的目录**——`link:` 不会安装插件的依赖（mermaid / three / react），装完渲染器会挂。正常安装请使用上面的 npm 命令；只有本地开发迭代才用 `link:`（见下文）。
+
+### 认准包名与版本
+
+- **包名必须带 scope**：npm 上另有一个同名但不带 scope 的 [`dsh-genui`](https://www.npmjs.com/package/dsh-genui)（Vue/OpenTiny 实现，与本仓库无关，维护者不同）。如果安装列表里描述是 "interactive charts, forms, calculators, dashboards, and mini apps"，那是那个项目——装上会因 peer 不兼容被宿主拒绝。本插件始终是 **`@changfenhuang/dsh-genui`**。
+- **宿主拒绝安装时**：支持的宿主范围由 peerDependencies 声明、宿主据此检查，升级到 npm 上 `latest` 的插件版本重装即可，无需改其他配置。
+- **解析到的版本低于 `latest`**：多半是 pnpm 的发布冷静期在起作用（默认跳过发布不满 24 小时的版本，且不提示）。等一天重试，或在 profile 的 `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude` 里加入目标版本；profile 里精确 pin 过旧版本的，先改依赖声明再重装。
 
 ### 从旧 `@omdsh-dev` 包名迁移
 
@@ -160,16 +169,19 @@ dsh plugin --profile web add link:$PWD
 - **ECharts 集成**：`echart` 节点渲染完整的 ECharts 图表，自动适配主题色、提示框和图例。两种模式：**预设简写**（`preset: 'bar' | 'line' | 'area' | 'pie' | 'scatter'` + `data`/`series`）可从 `chart` 节点快速升级；**完整选项**（`option` 字段）支持自定义图表类型、dataZoom、visualMap 等高级 ECharts 功能。echarts 引擎（~1 MB）按需懒加载——主包不含引擎，没有 `echart` 节点的对话不会下载它- **函数图**：`plot` 画曲线，参数滑块拖动实时重绘，支持自动动画
 
 - **测验**：`quiz` 点选判题 + 解析 + 重试；带 `action` 时答案同时回传模型（判题仍本地即时）
-- **本地判卷（交卷）**：多道选择题 = 每题的 `radio` 加 `group` + `answer`（正确答案）+ `explanation`（解析），再加一个 `submit` 交卷按钮——用户全部选完点一次，**分数、每题对错、解析当场在 UI 里出现，零模型往返**；题目随即锁定，「重新作答」本地重置（可选 `resetAction` 通知模型）。题目没带答案时才退回聚合 action（`fields` 收集所有带 `id` 的输入）
+- **本地判卷（交卷）**：多道选择题的每个 `radio` 设置 `group`、`answer` 和 `explanation`，再添加 `submit` 按钮。所需 radio 均已选择且当前 block 没有其他需要发送的表单状态时，分数、每题对错和解析直接显示在界面中；其他情况通过聚合 action 发送 `answers`、可选的 `fields`、`total` 和 `answered`。
+- **提交分组**：`groups` 引用当前 block 中的 submission member key，来源为 `radio.group`、`checkbox.group`、`input.id`、`textarea.id`、`select.id`、`slider.id`。radio 需已选择，checkbox 组需至少选择一项，普通字段需在 trim 后非空。`groups` 控制提交所需成员与完成进度；payload 继续收集当前 block 中已填写的表单状态。未设置 `groups` 时，至少有一个已完成成员即可提交。
 - **状态持久化**：答案、交卷锁定、输入值按「会话 + 内容指纹」自动保存——刷新页面/重开会话原样恢复，重渲染相同内容保留用户状态，新内容自动从头开始；上限 200 块 LRU 淘汰
 - **表单语义**：`input` 回车 / `textarea` Ctrl+Enter 即时提交（`submit:true`），不用等失焦；带 `id` 的字段值进 submit 的 `fields` 收集
 - **秘密禁令**：GenUI 不得索取密码、API Key、访问令牌、恢复码或其他秘密；密码输入即使出现也保持打码、不持久化、不进表单收集
 - **本地优先原则**：UI 自己能完成的状态变化（判卷、判题、重置、展开、选中）一律本地即时完成；action 只用于必须模型参与的事（生成新内容、执行工具、下一步建议）
 - **诚实交互**：交互组件必须带 `action`；不带 `action` 的按钮渲染为禁用态（消灭"看着能点、点了没反应"的假按钮）；带 `action` 的按钮点击后立即显示「已触发」本地反馈（只证明本地事件已触发，不代表模型已收到）
-- **事件循环**：按钮/开关/输入/下拉/复选/单选/文本域/测验带 `action`，点击/失焦回传模型，模型更新界面；同名 action 300ms 尾沿防抖，连点合并为一次（最后一次的值生效）
+- **事件循环**：按钮、复选框、单选、开关、下拉、输入、文本域、提交和测验等离散交互按一次手势一次事件立即回传模型；`slider` 连续拖动保留尾沿防抖，同一滑块只回传最终值，不同 `id` 的滑块互不合并。
 - **工具通道**：`render_ui` 工具把同一份 spec 渲染成工具行卡片（交付物型 UI 走工具、回答型 UI 走围栏）
 - **会话面板**：composer 上方常驻 dock，`render_ui` / `panel: true` 围栏原地更新同一块界面；`/panel` 命令客户端直开（`/panel <指令>` 转模型定制、`/panel clear` 清空）；顶边框可拖拽调高；`append: true` 增量合并——同名标签页追加内容、新标签页新增；整面板默认最多 200 节点 / 200 条追加，达到上限后模型应发送 `replace` 重建
-- **自愈与上限**：每个围栏过规格守卫——坏节点静默丢弃、数值钳位、字符串截断，整树 ≤200 节点 / 8 层嵌套，病态 spec 不会拖垮界面
+- **围栏自修**：默认开启；在 profile 的 cordis.patch.yml 中本插件条目的 `config:` 下设置 `fenceFeedback: false` 可以关闭同回合围栏修正。已调用 `validate_dsh_ui` 的 GenUI 回合若只输出 reasoning 并以 `stop` 结束，仍会转换为 `EMPTY_RESPONSE`，交给宿主重试策略处理。回答最终的 dsh-ui 围栏无法渲染时，插件借宿主的轮内转向（steer）把逐节点诊断送回**同一轮**，模型重发修好的围栏。每个 turn 最多发送两条 correction，渲染失败与“已验证但没有正式交付”共用该上限；同一 turn 内相同围栏 fingerprint 只修正一次，新 turn 可以重新修正相同错误；同一 turn 的零交付提醒只发送一次。plugin reload 后会从持久化的 correction message 恢复当前 turn 的围栏去重记录、已消费的 correction 次数以及零交付提醒记录。子代理回合不会收到围栏修正。
+- **自愈与上限**：每个围栏过规格守卫——坏节点静默丢弃（同围栏其余组件照常渲染，单个坏组件不再拖垮整条围栏）、数值钳位、字符串截断，整树 ≤200 节点 / 8 层嵌套，病态 spec 不会拖垮界面
+- **统一组件协议**：`card.label` → `title`、`table.data`/`table.items` → `rows`、`callout.kind`/`callout.desc` → `tone`/`content`（tone 值 `danger` → `error`）、`steps.items` → `steps`、`keyvalue.items` → `pairs`（记录内 `label` → `key`）、`file-tree.nodes` → `items`（记录内 `label` → `name`、有 children 时缺省 `dir`）等原生字段别名会在校验和渲染前确定性归一化；根级组件数组视为 `items`、双重编码的 JSON 字符串解一层；`validate_dsh_ui` 会报告归一化结果，并对原生组件未知字段给出警告，同时保持自定义 renderer 节点的透明兼容。
 - **图错误自愈**：mermaid 渲染失败自动修复重试（剥反引号、引号化中文/空格标签、去 `<br/>`），仍失败才降级源码；错误图永不直接上屏
 - **可访问性**：tabs/折叠/开关/进度条带完整 ARIA 与键盘导航（方向键切页、Home/End 跳转）
 - **零打扰**：不装插件时围栏只是代码块，不报错、不污染会话
@@ -220,7 +232,7 @@ dsh plugin --profile web add link:$PWD
 ## ❓ 常见问题
 
 - **显示成代码块？** 先在浏览器控制台找 `[genui] client active; fence-channel=registry|dom`。没有这行，即使 `client.js` 返回 200，也只是下载了文件、没有激活：请对齐网页配置依赖名、`package.json.name`、`cordis.patch.yml`、ModuleLoader id 和配置中的 bundle 名。出现这行后再查围栏标签/正文；宿主没有 registry 时会自动走 DOM 通道。
-- **渲染 dsh-ui fence 时聊天界面白屏？** dsh 版本太旧——先更新 dsh 再重装插件。
+- **渲染 dsh-ui fence 时聊天界面白屏？** 此版 dsh-genui 要求 DSH `^0.1.2-rc.1 || ^0.1.5-alpha.1 || ^0.1.6-alpha.1 || ^0.1.7-alpha.1`；使用 DSH `<=0.1.1-rc.x` 的用户请使用 dsh-genui `0.9.8`。
 - **`dsh: pnpm not found on PATH`？** 装 pnpm 后**新开终端**再试（`corepack enable` 或 `npm i -g pnpm`）。
 - **npm 安装返回 404？** npm 包是公开的，无需登录。先执行 `npm view @changfenhuang/dsh-genui version` 核对包名与公共 registry；若新版本刚发布仍返回 404，稍后重试。
 - **装了但 scene3d/mermaid/echarts 不渲染？** 引擎（mermaid / three / echarts）不再内联进 client.js——它们在首次用到时按需加载（`/plugins/@changfenhuang/dsh-genui/assets/*.js`，插件自带 HTTP 路由托管）。先重启 dsh web + 硬刷新（Cmd+Shift+R）；仍不渲染就卸掉重装（`dsh plugin --profile web remove @changfenhuang/dsh-genui` 后再 add）。旧版宿主缺少资产路由时会降级显示源码/加载失败提示，更新 dsh 即可。
@@ -229,42 +241,62 @@ dsh plugin --profile web add link:$PWD
 
 ## 🧑‍💻 开发
 
+### 嵌入其他应用
+
+支持 CSS Modules 和 TypeScript 的浏览器构建器可以从 `@changfenhuang/dsh-genui/embed` 导入 `GenuiBlock`、`GenuiActionContext`、`ErrorBoundary` 和 `processGenuiSpec`，复用同一份组件、样式与规格校验，无需加载 DSH 的插件入口。
+
+嵌入宿主通过 `initialState` / `onStateChange` 接管持久化，使用稳定的 `stateKey` 区分界面，通过 `GenuiActionContext.Provider` 接收动作。改变 `stateKey` 会开始新的交互生命周期；同一界面的后续刷新保留输入。设置 `onStateChange` 后不读写浏览器的交互状态存储。
+
+调用 `setGenuiAssetBase` 设置本地引擎目录；从公开的 `@changfenhuang/dsh-genui/assets/mermaid`、`assets/three`、`assets/echarts-core`、`assets/echarts` 构建对应脚本。模型指引从 `@changfenhuang/dsh-genui/skill` 读取。宿主只补自己的交付通道和设计变量；渲染器仍使用本包与 `@deepseek-ai/dsh-client-ui-primitives` 的组件。构建时提供 React、CSS Modules、KaTeX 字体及所用引擎依赖。
+
+### 导出 GenUI 成果文件
+
+已完成的 GenUI 区块提供“导出 → HTML”和“GenUI JSON”。`.html` 文件内含渲染器、样式、KaTeX WOFF2 字体和规格实际需要的图形引擎，本地控件可以继续使用，模型动作按钮会禁用。相对媒体地址会按导出页面的地址转换为绝对地址；离线打开时，网络媒体仍需连接原站点。`.genui.json` 保留原媒体地址、规范化规格、可持久化交互状态、语言和主题。自定义组件会禁用 HTML 导出，导出错误会显示在菜单旁。宿主可从 `@changfenhuang/dsh-genui/embed` 使用 `createGenuiArtifact`、`parseGenuiArtifact`、`serializeGenuiArtifact` 和 `buildStandaloneHtml`；`@changfenhuang/dsh-genui/assets/standalone` 指向可供复制或提供下载的运行文件。
+
 ```sh
 pnpm install
 pnpm run check   # 类型检查 + 全量测试 + 构建
 ```
+
+安装锁定依赖后，检查脚本（`pnpm run check` 或 `npm run check`）使用固定的 DSH `0.1.2-rc.1` 发布包。
+
+已验证宿主角色为 minimum `dsh-v0.1.2-rc.1`、current `dsh-v0.1.7-rc.2`、next `dsh-v0.2.0-rc.1`。DSH `0.2.0-rc.1` 当前属于预发布版本。CI 保持四条主要 lane：Node 22 + current，以及 Node 24 + minimum/current/next。DSH 发布新版本后，替换对应固定标签。
+
+`pnpm run check:host-api dsh-v0.1.7-rc.2` 与 `pnpm run check:host-api dsh-v0.2.0-rc.1` 会安装对应 DSH 发布包，运行 TypeScript 类型检查与 tsdown 构建。每条 CI 宿主 lane 随后会把生成的 tarball 安装到固定版本的 DSH 宿主并运行 packed smoke。
+
+运行 `node scripts/verify-pack.mjs --keep` 可保留已验收的 tarball，便于检查或运行 e2e；默认的 `node scripts/verify-pack.mjs` 会在验收后清理临时目录。
 
 ### 真机 e2e
 
 真实链路验证：起一个临时 dsh web → 装上插件 → 浏览器里发消息让模型输出 `dsh-ui` fence → 断言渲染 → 点击 action 按钮 → 断言模型响应（事件循环闭环）：
 
 ```sh
+export DSH_ROOT=/path/to/deepseek-harness-0.1.2-rc.1
+export DSH_BIN="$DSH_ROOT/apps/cli/lib/bin.js"
 DEEPSEEK_API_KEY=sk-... node scripts/e2e.mjs          # link 安装当前工作区
 ```
 
-前置：`dsh`/`pnpm` 在 PATH、`DEEPSEEK_API_KEY`、主仓 web 构建产物（playwright 从主仓解析）。PASS 时保存 `e2e-final.png` 截图。
+先构建 DSH `0.1.2-rc.1` checkout。按上面的示例将 `DSH_ROOT` 指向该 checkout，将 `DSH_BIN` 指向其中的 `apps/cli/lib/bin.js`；另需准备 `pnpm`、`DEEPSEEK_API_KEY` 和主仓 web 构建产物。PASS 时保存 `e2e-final.png` 截图。
 
 ### 视觉 e2e（无需模型 key）
 
-样式/组件迭代用：起真实 dsh web + link 安装插件 → 通过 DOM 通道注入组件画廊围栏 → headless Chrome 全页截图 + 本地交互（表格排序 / 判题 / 目录折叠 / 数值对齐）硬断言，不需要任何模型额度：
+样式/组件迭代用：使用 DSH `0.1.2-rc.1` checkout 起真实 dsh web + link 安装插件 → 通过 DOM 通道注入组件画廊围栏 → headless Chrome 全页截图 + 本地交互（表格排序 / 判题 / 目录折叠 / 数值对齐）硬断言，不需要任何模型额度。运行前按上面的示例将 `DSH_ROOT` 和 `DSH_BIN` 指向该 checkout：
 
 ```sh
 npx tsx scripts/e2e-visual.mts          # → .e2e-artifacts/gallery.png + interactions.png
 npx tsx scripts/e2e-visual.mts --keep   # 保留 scratch DSH_HOME 便于排查
 ```
 
-可覆盖：`--port 3098`、`--out <dir>`、`DSH_BIN`（默认 npm 生产模式 `~/node_modules/.bin/dsh`）、`PLAYWRIGHT_PATH`（默认全局 playwright-core）。
+可覆盖：`--port 3098`、`--out <dir>`、`DSH_BIN`（设为 DSH `0.1.2-rc.1` checkout 内的 `apps/cli/lib/bin.js`）、`PLAYWRIGHT_PATH`（默认全局 playwright-core）。
 
 ## 🗺️ Roadmap（已评估项）
 
 | 方向 | 结论 | 理由 |
 |---|---|---|
 | 增量 patch（模型只发 diff 不重发全量 spec） | 不做 | fence 一次 200–800 token，重发代价极小；patch 协议的教学成本与出错率不值得。若未来出现秒级自动刷新面板再议 |
-| action 防抖/去重 | ✅ 已做（300ms 尾沿，按 action 名独立） | 连点刷屏是真实摩擦，收口点一处改动 |
+| action 回传 | ✅ 离散交互立即回传；slider 拖动按 action 和 `id` 防抖 | 离散操作逐次回传，slider 拖动只回传最终值 |
 | 跨会话状态持久化（回放恢复 tabs/开关） | 不做 | 回放重置是更正确的默认行为（模型已用新 fence 更新过界面）；流式期间状态天然保留 |
 | MCP 适配器 / 独立画廊页 / i18n | 不做 | 无跨工具需求信号；画廊素材已被 `gallery.ts` + demo-prompts + README 截图覆盖；内置文案仅 6 处 |
-
-单元测试和构建直接使用锁定的 dsh rc.8 发布包；只有源码级或端到端检查才需要设置 `DSH_ROOT`。
 
 ## 🔗 友情链接
 

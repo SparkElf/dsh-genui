@@ -5,11 +5,14 @@
  * @module @changfenhuang/dsh-genui/client/blocks/advanced
  */
 import { memo, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
-import { CodeBlock, DiffBlock, JsonTree, writeClipboard } from '@deepseek-ai/dsh-client-ui-primitives'
+import { CodeBlock, DiffBlock, JsonTree, writeClipboard } from '../primitive-adapter.ts'
+import { renderInline } from '../inline.ts'
 import css from '../GenuiBlock.module.css'
-import { GENUI_LIMITS } from '../guard.ts'
+import { GENUI_LIMITS } from '../genui-runtime/index.ts'
 import { PlotBlock } from '../PlotBlock.tsx'
 import { renderNode } from './render-node.tsx'
+import { codeBlockLabels, diffBlockLabels, jsonTreeLabels } from '../primitive-labels.ts'
+import { useT } from '../i18n/index.ts'
 import type { AnswersState, GenuiBlockProps } from './state.ts'
 import type {
   GenuiAccordion, GenuiBreadcrumb, GenuiCallout, GenuiCode, GenuiCopy, GenuiDiff, GenuiFileTree, GenuiFileTreeNode,
@@ -26,8 +29,8 @@ export const CalloutNode = memo(function CalloutNode({ node }: { node: GenuiCall
   const toneClass = CALLOUT_TONES[tone] ?? css.calloutInfo
   return (
     <div className={`${css.callout} ${toneClass}`} data-genui-callout>
-      {node.title !== undefined && <div className={css.calloutTitle}>{node.title}</div>}
-      <div className={css.calloutBody}>{node.content}</div>
+      {node.title !== undefined && <div className={css.calloutTitle}>{renderInline(node.title)}</div>}
+      <div className={css.calloutBody}>{renderInline(node.content)}</div>
     </div>
   )
 })
@@ -45,8 +48,8 @@ export const StepsNode = memo(function StepsNode({ steps }: { steps: GenuiSteps 
           <li key={i} className={`${css.step} ${done ? css.stepDone : ''} ${active ? css.stepActive : ''}`}>
             <span className={css.stepMarker}>{done ? '✓' : String(i + 1)}</span>
             <span className={css.stepContent}>
-              <span className={css.stepTitle}>{step.title}</span>
-              {step.desc !== undefined && <span className={css.stepDesc}>{step.desc}</span>}
+              <span className={css.stepTitle}>{renderInline(step.title)}</span>
+              {step.desc !== undefined && <span className={css.stepDesc}>{renderInline(step.desc)}</span>}
             </span>
           </li>
         )
@@ -62,8 +65,8 @@ export const KeyValueNode = memo(function KeyValueNode({ node }: { node: GenuiKe
     <dl className={css.keyvalue}>
       {pairs.map((pair, i) => (
         <div key={i} className={css.kvRow}>
-          <dt className={css.kvKey}>{pair.key}</dt>
-          <dd className={css.kvValue}>{pair.value}</dd>
+          <dt className={css.kvKey}>{renderInline(pair.key)}</dt>
+          <dd className={css.kvValue}>{renderInline(pair.value)}</dd>
         </div>
       ))}
     </dl>
@@ -89,21 +92,24 @@ export const PlotNode = memo(function PlotNode({ plot }: { plot: GenuiPlot }) {
 
 /** Diff: 收编 dsh DiffBlock (same path/oldText/newText shape as DiffHunk). */
 export const DiffNode = memo(function DiffNode({ node }: { node: GenuiDiff }) {
-  return <DiffBlock diffs={node.diffs} />
+  useT()
+  return <DiffBlock diffs={node.diffs} labels={diffBlockLabels()} />
 })
 
 /** Json: 收编 dsh JsonTree. */
 export const JsonNode = memo(function JsonNode({ node }: { node: GenuiJson }) {
+  useT()
   const data = node.value
   if (typeof data !== 'object' || data === null) {
     return <div className={css.jsonScalar}>{String(data)}</div>
   }
-  return <JsonTree data={data as object | unknown[]} copyable />
+  return <JsonTree data={data as object | unknown[]} label="JSON" labels={jsonTreeLabels()} copyable />
 })
 
 /** Code: 收编 dsh CodeBlock with explicit language. */
 export const CodeNode = memo(function CodeNode({ node }: { node: GenuiCode }) {
-  return <CodeBlock code={node.code.slice(0, GENUI_LIMITS.maxCode)} lang={node.lang} />
+  useT()
+  return <CodeBlock {...codeBlockLabels()} code={node.code.slice(0, GENUI_LIMITS.maxCode)} lang={node.lang} />
 })
 
 /**
@@ -157,7 +163,7 @@ export function TabsNode({ tabs, onAction, depth = 0, answers }: {
             className={`${css.tab} ${i === safeActive ? css.tabActive : ''}`}
             onClick={() => setActive(i)}
           >
-            {tab.label}
+            {renderInline(tab.label, false)}
           </button>
         ))}
       </div>
@@ -200,8 +206,8 @@ export function AccordionNode({ node, onAction, depth = 0, answers }: {
             aria-controls={`${uid}-body-${i}`}
             onClick={() => setOpen(open === i ? null : i)}
           >
-            <span className={css.accTitle}>{item.title}</span>
-            <span className={css.accChevron}>{open === i ? '▾' : '▸'}</span>
+            <span className={css.accTitle}>{renderInline(item.title, false)}</span>
+            <span className={css.accChevron} data-open={open === i} aria-hidden>▸</span>
           </button>
           {open === i && (
             <div className={css.accBody} id={`${uid}-body-${i}`} aria-labelledby={`${uid}-head-${i}`}>
@@ -247,6 +253,7 @@ async function writeCopyText(text: string): Promise<boolean> {
  * (not inside the button) — button content is atomic to screen readers, so a
  * live region inside it would never announce. */
 export const CopyNode = memo(function CopyNode({ node }: { node: GenuiCopy }) {
+  const t = useT()
   const [copied, setCopied] = useState(false)
   return (
     <>
@@ -262,9 +269,9 @@ export const CopyNode = memo(function CopyNode({ node }: { node: GenuiCopy }) {
           })
         }}
       >
-        {copied ? '✓ 已复制' : (node.label ?? '复制')}
+        {copied ? t('label.copiedShort') : renderInline(node.label ?? t('label.copy'), false)}
       </button>
-      <span className={css.visuallyHidden} role="status">{copied ? '已复制到剪贴板' : ''}</span>
+      <span className={css.visuallyHidden} role="status">{copied ? t('label.copiedToClipboard') : ''}</span>
     </>
   )
 })
@@ -276,6 +283,7 @@ type MermaidRenderState =
 
 /** Mermaid: lazily loaded diagram renderer. */
 export const MermaidNode = memo(function MermaidNode({ node }: { node: GenuiMermaid }) {
+  const t = useT()
   const [state, setState] = useState<MermaidRenderState>({ status: 'loading' })
   const code = node.code.slice(0, GENUI_LIMITS.maxMermaid)
   useEffect(() => {
@@ -292,13 +300,14 @@ export const MermaidNode = memo(function MermaidNode({ node }: { node: GenuiMerm
     })()
     return () => { alive = false }
   }, [code])
-  if (state.status === 'error') return <div className={css.mermaidFallback}><pre>{code}</pre><div className={css.mermaidErr}>图语法有误，已降级显示源码</div></div>
-  if (state.status === 'loading') return <div className={css.mermaidFallback}><pre>{code}</pre><div className={css.mermaidHint}>渲染中…</div></div>
+  if (state.status === 'error') return <div className={css.mermaidFallback}><pre>{code}</pre><div className={css.mermaidErr}>{t('block.mermaidError')}</div></div>
+  if (state.status === 'loading') return <div className={css.mermaidFallback}><pre>{code}</pre><div className={css.mermaidHint}>{t('block.mermaidLoading')}</div></div>
   return <div className={css.mermaid} dangerouslySetInnerHTML={{ __html: state.html }} data-genui-mermaid />
 })
 
 /** Scene3D: three.js WebGL canvas, lazily imported. */
 export const Scene3DNode = memo(function Scene3DNode({ node }: { node: GenuiScene3D }) {
+  const t = useT()
   const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading')
   const ref = useRef<HTMLDivElement | null>(null)
   // Mesh cap mirrored from the guard: a pathological scene never reaches
@@ -320,10 +329,10 @@ export const Scene3DNode = memo(function Scene3DNode({ node }: { node: GenuiScen
   }, [scene])
   return (
     <div className={css.scene3dWrap} data-genui-scene3d>
-      {node.title !== undefined && <div className={css.scene3dTitle}>{node.title}</div>}
+      {node.title !== undefined && <div className={css.scene3dTitle}>{renderInline(node.title)}</div>}
       <div ref={ref} className={css.scene3dCanvas} />
-      {status === 'loading' && <div className={css.scene3dHint}>加载 3D 场景…</div>}
-      {status === 'error' && <div className={css.scene3dHint}>3D 渲染失败</div>}
+      {status === 'loading' && <div className={css.scene3dHint}>{t('block.scene3dLoading')}</div>}
+      {status === 'error' && <div className={css.scene3dHint}>{t('block.scene3dError')}</div>}
     </div>
   )
 })
@@ -341,10 +350,10 @@ export const TimelineNode = memo(function TimelineNode({ node }: { node: GenuiTi
           </div>
           <div className={css.tlBody}>
             <div className={css.tlHead}>
-              <span className={css.tlTitle}>{item.title}</span>
-              {item.time !== undefined && <span className={css.tlTime}>{item.time}</span>}
+              <span className={css.tlTitle}>{renderInline(item.title, false)}</span>
+              {item.time !== undefined && <span className={css.tlTime}>{renderInline(item.time)}</span>}
             </div>
-            {item.desc !== undefined && <div className={css.tlDesc}>{item.desc}</div>}
+            {item.desc !== undefined && <div className={css.tlDesc}>{renderInline(item.desc)}</div>}
           </div>
         </div>
       ))}
@@ -355,6 +364,24 @@ export const TimelineNode = memo(function TimelineNode({ node }: { node: GenuiTi
 /** FileTree: indented tree of files and folders. Directory rows are LOCAL
  * collapsible (spec.ts promised "collapsible children"; this makes it true)
  * — click a dir to fold/unfold, default fully open. Zero model round trip. */
+/** 14px folder / file glyphs: an emoji-free way to tell rows apart at a glance. */
+function FolderGlyph() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+      <path d="M1.6 3.4h4.1l1.3 1.7h7.4v7.2a1 1 0 0 1-1 1H2.6a1 1 0 0 1-1-1z" fill="currentColor" opacity="0.85" />
+    </svg>
+  )
+}
+
+function FileGlyph() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+      <path d="M3.8 1.6h4.9L13 5.9v8.5a1 1 0 0 1-1 1H4.8a1 1 0 0 1-1-1z" fill="none" stroke="currentColor" strokeWidth="1.2" />
+      <path d="M8.7 1.7v4.3h4.2" fill="none" stroke="currentColor" strokeWidth="1.2" />
+    </svg>
+  )
+}
+
 export const FileTreeNode = memo(function FileTreeNode({ node }: { node: GenuiFileTree }) {
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set())
   const toggle = (k: string): void => {
@@ -365,22 +392,43 @@ export const FileTreeNode = memo(function FileTreeNode({ node }: { node: GenuiFi
       return next
     })
   }
+  // Children live in their OWN container under the row. They used to be
+  // appended inside `.ftRow` (display: flex), so a nested tree rendered
+  // side-by-side on one line instead of stacking.
   const renderNode = (n: GenuiFileTreeNode, depth: number, path: string): ReactNode => {
     if (depth > GENUI_LIMITS.maxTreeDepth) return null
     const isDir = n.type === 'dir' || (n.children !== undefined && n.children.length > 0)
     const folded = isDir && collapsed.has(path)
     return (
-      <div key={path} className={css.ftRow} style={{ paddingLeft: `${depth * 16}px` }}>
-        <button
-          type="button"
-          className={css.ftNameBtn}
-          aria-expanded={isDir ? !folded : undefined}
-          onClick={isDir ? () => toggle(path) : undefined}
-        >
-          <span className={`${css.ftIcon} ${isDir ? css.ftIconDir : ''}`} aria-hidden>{isDir ? (folded ? '▸' : '▾') : '·'}</span>
-          <span className={`${css.ftName} ${isDir ? css.ftDir : ''}`}>{n.name}</span>
-        </button>
-        {isDir && !folded && (n.children ?? []).map((c, ci) => renderNode(c, depth + 1, `${path}/${ci}`))}
+      <div key={path}>
+        <div className={css.ftRow} style={{ paddingLeft: `${depth * 14 + 4}px` }}>
+          {Array.from({ length: depth }, (_v, i) => (
+            <span key={i} className={css.ftGuide} style={{ left: `${4 + i * 14 + 6}px` }} aria-hidden />
+          ))}
+          <button
+            type="button"
+            className={css.ftNameBtn}
+            aria-expanded={isDir ? !folded : undefined}
+            onClick={isDir ? () => toggle(path) : undefined}
+          >
+            <span
+              className={css.ftChevron}
+              data-open={isDir ? String(!folded) : undefined}
+              aria-hidden
+            >
+              {isDir ? '▸' : ''}
+            </span>
+            <span className={`${css.ftGlyph} ${isDir ? css.ftGlyphDir : ''}`} aria-hidden>
+              {isDir ? <FolderGlyph /> : <FileGlyph />}
+            </span>
+            <span className={`${css.ftName} ${isDir ? css.ftDir : ''}`}>{n.name}</span>
+          </button>
+        </div>
+        {isDir && !folded && (
+          <div className={css.ftChildren}>
+            {(n.children ?? []).map((c, ci) => renderNode(c, depth + 1, `${path}/${ci}`))}
+          </div>
+        )}
       </div>
     )
   }
@@ -396,7 +444,16 @@ export const QuizNode = memo(function QuizNode({ node, onAction }: {
   node: GenuiQuiz
   onAction?: GenuiBlockProps['onAction']
 }) {
+  const t = useT()
   const [selected, setSelected] = useState<number | null>(null)
+  // `id` is the documented reset signal: when the model swaps the quiz in
+  // place (same tree position, new question), the component instance is
+  // reused, so the answered state must not leak onto the new question.
+  const [prevId, setPrevId] = useState(node.id)
+  if (node.id !== prevId) {
+    setPrevId(node.id)
+    setSelected(null)
+  }
   const options = node.options.slice(0, GENUI_LIMITS.maxQuizOptions)
   const answered = selected !== null
   const chosen = selected === null ? undefined : options[selected]
@@ -404,7 +461,7 @@ export const QuizNode = memo(function QuizNode({ node, onAction }: {
   const action = node.action
   return (
     <div className={css.quiz} data-genui-quiz>
-      <div className={css.quizQuestion}>{node.question}</div>
+      <div className={css.quizQuestion}>{renderInline(node.question)}</div>
       <div className={css.quizOptions}>
         {options.map((opt, i) => {
           const isChosen = selected === i
@@ -431,8 +488,12 @@ export const QuizNode = memo(function QuizNode({ node, onAction }: {
                 }
               }}
             >
-              <span className={css.quizMarker}>{answered && (opt.correct === true ? '✓' : isChosen ? '✗' : '')}</span>
-              {opt.label}
+              {/* Before answering: a radio affordance so the row reads as a
+                  choice. After: ✓ on the right answer, ✗ on a wrong pick. */}
+              <span className={css.quizMarker}>
+                {answered ? (opt.correct === true ? '✓' : isChosen ? '✗' : '') : isChosen ? '●' : '○'}
+              </span>
+              {renderInline(opt.label, false)}
             </button>
           )
         })}
@@ -440,11 +501,11 @@ export const QuizNode = memo(function QuizNode({ node, onAction }: {
       {answered && (
         <div className={css.quizResult} aria-live="polite">
           <div className={correct ? css.quizCorrectMsg : css.quizWrongMsg}>
-            {correct ? '✓ 回答正确！' : '✗ 再想想看'}
-            {chosen?.feedback !== undefined && <div className={css.quizFeedback}>{chosen.feedback}</div>}
+            {correct ? t('block.quizCorrect') : t('block.quizWrong')}
+            {chosen?.feedback !== undefined && <div className={css.quizFeedback}>{renderInline(chosen.feedback)}</div>}
           </div>
-          {node.explanation !== undefined && <div className={css.quizExplanation}>{node.explanation}</div>}
-          <button type="button" className={css.quizRetry} onClick={() => setSelected(null)}>重新作答</button>
+          {node.explanation !== undefined && <div className={css.quizExplanation}>{renderInline(node.explanation)}</div>}
+          <button type="button" className={css.quizRetry} onClick={() => setSelected(null)}>{t('block.quizRetry')}</button>
         </div>
       )}
     </div>
@@ -458,7 +519,7 @@ export const BreadcrumbNode = memo(function BreadcrumbNode({ node }: { node: Gen
     <nav className={css.breadcrumb} aria-label="breadcrumb">
       {items.map((item, i) => (
         <span key={i} className={css.bcItem}>
-          <span className={`${css.bcText} ${i === items.length - 1 ? css.bcCurrent : ''}`}>{item}</span>
+          <span className={`${css.bcText} ${i === items.length - 1 ? css.bcCurrent : ''}`}>{renderInline(item)}</span>
           {i < items.length - 1 && <span className={css.bcSep}>/</span>}
         </span>
       ))}

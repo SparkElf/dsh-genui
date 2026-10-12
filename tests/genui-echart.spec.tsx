@@ -1,39 +1,77 @@
 // @vitest-environment jsdom
 // EChartNode rendering: preset five forms, error fallback, option priority,
 // title/height, role=img/aria-label, scatter with CJK labels.
-// The echarts engine is mocked via vi.doMock + dynamic import (setup.ts
-// loads the real module before the test file, so vi.mock alone can't
-// replace it — vi.resetModules + vi.doMock + dynamic import bypasses the
-// cache).
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render } from '@testing-library/react'
 import type { GenuiEChart } from '../src/client/spec'
+import { EChartNode, SERIES_FALLBACK } from '../src/client/EChartNode.tsx'
+import { createChart } from '../src/client/echarts-lazy.ts'
+
+vi.mock('../src/client/echarts-lazy.ts', async () => {
+  // Keep the real preset→engine mapping so the mock stays honest about which
+  // bundle a preset needs (progressive disclosure).
+  const actual = await vi.importActual<typeof import('../src/client/echarts-lazy.ts')>('../src/client/echarts-lazy.ts')
+  return { createChart: vi.fn(), CORE_PRESETS: actual.CORE_PRESETS }
+})
+beforeEach(() => {
+  vi.mocked(createChart).mockReset()
+  vi.stubGlobal('ResizeObserver', class {
+    observe() {}
+    disconnect() {}
+  })
+})
 
 afterEach(() => {
   cleanup()
+  vi.unstubAllGlobals()
 })
 
 function fakeInstance() {
   return { setOption: vi.fn(), resize: vi.fn(), dispose: vi.fn() }
 }
 
-type EChartNodeModule = typeof import('../src/client/EChartNode')
+describe('EChartNode: series palette', () => {
+  it('keeps eight distinct fallback hues (host tokens may be absent)', () => {
+    // The regression: every slot fell back to the single accent colour, so a
+    // multi-series chart came out entirely blue.
+    expect(SERIES_FALLBACK.length).toBeGreaterThanOrEqual(6)
+    expect(new Set(SERIES_FALLBACK).size).toBe(SERIES_FALLBACK.length)
+  })
+})
 
-/** Dynamically import EChartNode with echarts-lazy mocked. */
-async function importWithMock(
-  createChartImpl: (el: HTMLElement, option: unknown, opts?: { height?: number }) => Promise<unknown> | unknown,
-): Promise<{ EChartNode: React.ComponentType<{ node: GenuiEChart }> }> {
-  vi.resetModules()
-  vi.doMock('../src/client/echarts-lazy.ts', () => ({
-    createChart: vi.fn(createChartImpl),
-  }))
-  return (await import('../src/client/EChartNode.tsx')) as EChartNodeModule
-}
+describe('EChartNode: word cloud', () => {
+  it('cycles explicit palette colors per word', async () => {
+    vi.mocked(createChart).mockResolvedValue(fakeInstance())
+    render(<EChartNode node={{ type: 'echart', preset: 'wordCloud', palette: ['#123456', '#abcdef'], data: [
+      { label: 'A', value: 3 }, { label: 'B', value: 2 }, { label: 'C', value: 1 },
+    ] }} />)
+    await vi.waitFor(() => {
+      expect(createChart).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ series: [expect.objectContaining({ data: [
+        { name: 'A', value: 3, textStyle: { color: '#123456' } },
+        { name: 'B', value: 2, textStyle: { color: '#abcdef' } },
+        { name: 'C', value: 1, textStyle: { color: '#123456' } },
+      ] })] }), expect.anything(), 'full')
+    })
+  })
+
+  it('builds weighted words and loads the full engine', async () => {
+    vi.mocked(createChart).mockResolvedValue(fakeInstance())
+    render(<EChartNode node={{ type: 'echart', preset: 'wordCloud', data: [{ label: '系统', value: 80 }, { label: '用户', value: 30 }] }} />)
+    await vi.waitFor(() => {
+      expect(createChart).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        series: [expect.objectContaining({ type: 'wordCloud', data: [expect.objectContaining({ name: '系统', value: 80 }), expect.objectContaining({ name: '用户', value: 30 })] })],
+      }), expect.anything(), 'full')
+    })
+  })
+})
 
 describe('EChartNode: preset rendering', () => {
   it('renders data-genui-echart container for each preset', async () => {
-    for (const preset of ['bar', 'line', 'area', 'pie', 'scatter'] as const) {
-      const { EChartNode } = await importWithMock(() => Promise.resolve(fakeInstance()))
+    for (const preset of [
+      'bar', 'line', 'area', 'pie', 'scatter',
+      'radar', 'gauge', 'funnel', 'treemap', 'sankey', 'graph', 'heatmap', 'bigline',
+    ] as const) {
+      vi.mocked(createChart).mockImplementation(() => Promise.resolve(fakeInstance()))
       const node: GenuiEChart = { type: 'echart', preset, data: [{ label: 'a', value: 1 }] }
       const { container, unmount } = render(<EChartNode node={node} />)
       await vi.waitFor(() => {
@@ -46,7 +84,7 @@ describe('EChartNode: preset rendering', () => {
 
 describe('EChartNode: error fallback', () => {
   it('shows error fallback when engine load fails', async () => {
-    const { EChartNode } = await importWithMock(() => Promise.reject(new Error('asset 404')))
+    vi.mocked(createChart).mockImplementation(() => Promise.reject(new Error('asset 404')))
     const node: GenuiEChart = { type: 'echart', preset: 'bar', data: [{ label: 'a', value: 1 }] }
     const { container } = render(<EChartNode node={node} />)
     await vi.waitFor(() => {
@@ -58,7 +96,7 @@ describe('EChartNode: error fallback', () => {
 describe('EChartNode: option vs preset', () => {
   it('option takes priority over preset', async () => {
     let capturedOption: unknown
-    const { EChartNode } = await importWithMock((_el, option) => {
+    vi.mocked(createChart).mockImplementation((_el, option) => {
       capturedOption = option
       return Promise.resolve(fakeInstance())
     })
@@ -80,7 +118,7 @@ describe('EChartNode: option vs preset', () => {
 
 describe('EChartNode: title and height', () => {
   it('renders title when provided', async () => {
-    const { EChartNode } = await importWithMock(() => Promise.resolve(fakeInstance()))
+    vi.mocked(createChart).mockImplementation(() => Promise.resolve(fakeInstance()))
     const node: GenuiEChart = { type: 'echart', preset: 'bar', title: '销售趋势', data: [{ label: 'a', value: 1 }] }
     const { container } = render(<EChartNode node={node} />)
     await vi.waitFor(() => {
@@ -90,7 +128,7 @@ describe('EChartNode: title and height', () => {
   })
 
   it('applies custom height to canvas', async () => {
-    const { EChartNode } = await importWithMock(() => Promise.resolve(fakeInstance()))
+    vi.mocked(createChart).mockImplementation(() => Promise.resolve(fakeInstance()))
     const node: GenuiEChart = { type: 'echart', preset: 'bar', height: 500, data: [{ label: 'a', value: 1 }] }
     const { container } = render(<EChartNode node={node} />)
     await vi.waitFor(() => {
@@ -101,7 +139,7 @@ describe('EChartNode: title and height', () => {
   })
 
   it('defaults height to 300px', async () => {
-    const { EChartNode } = await importWithMock(() => Promise.resolve(fakeInstance()))
+    vi.mocked(createChart).mockImplementation(() => Promise.resolve(fakeInstance()))
     const node: GenuiEChart = { type: 'echart', preset: 'bar', data: [{ label: 'a', value: 1 }] }
     const { container } = render(<EChartNode node={node} />)
     await vi.waitFor(() => {
@@ -114,7 +152,7 @@ describe('EChartNode: title and height', () => {
 
 describe('EChartNode: accessibility', () => {
   it('renders role=img and aria-label with title', async () => {
-    const { EChartNode } = await importWithMock(() => Promise.resolve(fakeInstance()))
+    vi.mocked(createChart).mockImplementation(() => Promise.resolve(fakeInstance()))
     const node: GenuiEChart = { type: 'echart', preset: 'bar', title: '图表', data: [{ label: 'a', value: 1 }] }
     const { container } = render(<EChartNode node={node} />)
     await vi.waitFor(() => {
@@ -125,7 +163,7 @@ describe('EChartNode: accessibility', () => {
   })
 
   it('renders aria-label fallback when no title', async () => {
-    const { EChartNode } = await importWithMock(() => Promise.resolve(fakeInstance()))
+    vi.mocked(createChart).mockImplementation(() => Promise.resolve(fakeInstance()))
     const node: GenuiEChart = { type: 'echart', preset: 'bar', data: [{ label: 'a', value: 1 }] }
     const { container } = render(<EChartNode node={node} />)
     await vi.waitFor(() => {
@@ -138,7 +176,7 @@ describe('EChartNode: accessibility', () => {
 describe('EChartNode: scatter with CJK labels', () => {
   it('passes category xAxis with CJK labels (not value axis)', async () => {
     let capturedOption: unknown
-    const { EChartNode } = await importWithMock((_el, option) => {
+    vi.mocked(createChart).mockImplementation((_el, option) => {
       capturedOption = option
       return Promise.resolve(fakeInstance())
     })

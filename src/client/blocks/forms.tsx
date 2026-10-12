@@ -3,10 +3,14 @@
  * input/select/textarea. All state flows through the shared AnswersState.
  * @module @changfenhuang/dsh-genui/client/blocks/forms
  */
+import { renderInline } from '../inline.ts'
 import { useEffect, useId, useRef, useState } from 'react'
 import css from '../GenuiBlock.module.css'
-import { GENUI_LIMITS } from '../guard.ts'
-import type { AnswersState, GenuiBlockProps, QuestionMeta } from './state.ts'
+import { GENUI_LIMITS } from '../genui-runtime/index.ts'
+import { useT } from '../i18n/index.ts'
+import { resolveSubmitState } from '../submission-registry.ts'
+import type { RadioSubmissionMember } from '../submission-registry.ts'
+import type { AnswersState, GenuiBlockProps } from './state.ts'
 import type { GenuiInput, GenuiRadio, GenuiSelect, GenuiSlider, GenuiSubmit, GenuiSwitch, GenuiTextarea } from '../spec.ts'
 
 export function RadioNode({ node, onAction, answers }: {
@@ -20,7 +24,7 @@ export function RadioNode({ node, onAction, answers }: {
   const options = node.options.slice(0, GENUI_LIMITS.maxOptions)
   // No default selection unless the model explicitly sets `selected` — a
   // pre-checked first option silently swallows the user's "keep the default"
-  // answer (the registry only records real change events). A DURABLE answer
+  // answer (the interaction state only records selected values). A DURABLE answer
   // (restored from localStorage) wins over both. The parent key includes the
   // reset round, so 重新作答 remounts this radio with a clean selection —
   // no sync effect needed.
@@ -30,17 +34,8 @@ export function RadioNode({ node, onAction, answers }: {
   const [selected, setSelected] = useState<number | null>(restoredIndex >= 0 ? restoredIndex : (node.selected ?? null))
   const uid = useId()
   const locked = grouped && answers?.locked === true
-  // Register question metadata for local grading (mount + when the question
-  // changes). `answers` is deliberately NOT a dep: the callback identity is
-  // stable and re-registering on every answers update is needless churn.
   useEffect(() => {
     if (group === undefined) return
-    answers?.registerMeta(group, {
-      label: node.label ?? group,
-      options,
-      answer: node.answer,
-      explanation: node.explanation,
-    })
     // A model-provided default selection IS the answer — but only when the
     // group has no durable answer yet (a restored user choice must win).
     if (node.selected !== undefined && options[node.selected] !== undefined && answers?.answers[group] === undefined) {
@@ -50,7 +45,7 @@ export function RadioNode({ node, onAction, answers }: {
   }, [group, node.label, node.answer, node.explanation, node.options, node.selected])
   return (
     <div className={css.fieldGroup} role="radiogroup" aria-label={node.label}>
-      {node.label !== undefined && <span className={css.fieldLabel}>{node.label}</span>}
+      {node.label !== undefined && <span className={css.fieldLabel}>{renderInline(node.label, false)}</span>}
       {options.map((opt, i) => (
         <label key={i} className={css.radio}>
           <input
@@ -68,94 +63,90 @@ export function RadioNode({ node, onAction, answers }: {
               }
             }}
           />
-          <span>{opt}</span>
+          <span>{renderInline(opt, false)}</span>
         </label>
       ))}
     </div>
   )
 }
 
-/** Resolve a question's correct label from its metadata. */
-export function correctLabelOf(m: QuestionMeta): string | undefined {
+/** 根据静态 radio member 获取正确选项的标签。 */
+export function correctLabelOf(m: RadioSubmissionMember): string | undefined {
   if (m.answer === undefined) return undefined
   if (typeof m.answer === 'number') return m.options[m.answer]
   return m.answer
 }
 
-/** Submit: the "交卷" control of a grouped-radio block. LOCAL-FIRST (v2.6):
- * when at least one question carries `answer` data the click grades IN PLACE
- * — score, per-question right/wrong, explanations — with zero model round
- * trip, and locks the questions until 重新作答 resets them. Only when NO
- * question has answers does it fall back to firing ONE action
- * (`{type:'submit', answers, total, answered}`). Disabled until the
- * selection criteria are met (all listed groups answered, or ≥1 answer
- * without a group list); the hint shows the progress. */
+/** 汇总当前 block 的表单状态，并根据 resolver 的结果提交或本地判卷。 */
 export function SubmitNode({ node, onAction, answers }: {
   node: GenuiSubmit
   onAction?: GenuiBlockProps['onAction']
   answers?: AnswersState | undefined
 }) {
+  const t = useT()
   const recorded = answers?.answers ?? {}
+  const multiRecorded = answers?.multiAnswers ?? {}
   const fields = answers?.fields ?? {}
-  const meta = answers?.meta ?? {}
   const expected = node.groups
   // One shared notion of "filled fields" for answered/ready/payload: non-blank
   // values only, secrets (password inputs) never collected into submit.
   const filledFields = Object.fromEntries(
     Object.entries(fields).filter(([id, v]) => v.trim() !== '' && !answers?.secretFields.has(id)),
   )
-  // Without an explicit group list, the submit counts radio answers AND
-  // filled fields — a fields-only form (inputs with id + submit) enables
-  // once any field has a value.
-  const answered = expected === undefined
-    ? Math.max(Object.keys(recorded).length, Object.keys(filledFields).length)
-    : expected.filter(g => recorded[g] !== undefined).length
-  const total = expected?.length ?? answered
-  const scope = expected ?? Object.keys(recorded)
-  // Local grading is possible when ANY in-scope question carries answers.
-  const canGradeLocally = scope.some(g => meta[g]?.answer !== undefined)
+  const resolved = answers === undefined ? { scope: [], answered: 0, total: expected?.length ?? 0, localGradeEligible: false, hasOutOfScopePayload: false }
+    : resolveSubmitState({
+      registry: answers.registry,
+      ...(expected === undefined ? {} : { groups: expected }),
+      state: { answers: recorded, multiAnswers: multiRecorded, fields, secretFields: answers.secretFields },
+    })
+  const { scope, answered, total } = resolved
+  const canSendAction = node.action !== undefined && onAction !== undefined
+  const shouldGradeLocally = resolved.localGradeEligible && (!resolved.hasOutOfScopePayload || !canSendAction)
   const submitted = answers?.locked === true
+  const collectedAnswers: Record<string, string | string[]> = {
+    ...recorded,
+    ...multiRecorded,
+  }
   // Ready = enough answers AND the click can do something: either local
   // grading, or a real action name + provider. A submit with neither is a
-  // display-only control — honest disabled affordance (action is optional:
-  // local grading needs no round trip).
+  // display-only control — honest disabled affordance.
   const ready = answered > 0 && answered >= total
-    && (canGradeLocally || (node.action !== undefined && onAction !== undefined))
+    && (shouldGradeLocally || canSendAction)
 
   if (submitted) {
     // ── local grading result ──
-    const graded = scope.filter(g => recorded[g] !== undefined && meta[g]?.answer !== undefined)
-    const score = graded.filter(g => recorded[g] === correctLabelOf(meta[g]!)).length
+    const graded = scope.filter((member): member is RadioSubmissionMember => member.kind === 'radio' && recorded[member.key] !== undefined && member.answer !== undefined)
+    const score = graded.filter(member => recorded[member.key] === correctLabelOf(member)).length
     return (
       <div className={css.gradeWrap} data-genui-grade>
         <div className={css.gradeScore}>
           <span className={css.gradeScoreValue}>{score} / {graded.length}</span>
-          <span className={css.gradeScoreLabel}>得分{graded.length < scope.length ? `（${scope.length - graded.length} 题无答案未计分）` : ''}</span>
+          <span className={css.gradeScoreLabel}>{t('block.score')}{graded.length < scope.length ? t('block.scoreUngraded', { count: scope.length - graded.length }) : ''}</span>
         </div>
         <div className={css.gradeList}>
-          {scope.map(g => {
-            const entry = recorded[g]
-            const m = meta[g]
-            if (entry === undefined || m === undefined) return null
+          {scope.map(m => {
+            if (m.kind !== 'radio') return null
+            const entry = recorded[m.key]
+            if (entry === undefined) return null
             const correct = correctLabelOf(m)
             if (correct === undefined) {
               return (
-                <div key={g} className={css.gradeItem}>
-                  <span className={css.gradeQ}>{m.label}</span>
-                  <span className={css.gradeAns}>你的答案：{entry}</span>
+                <div key={m.key} className={css.gradeItem}>
+                  <span className={css.gradeQ}>{renderInline(m.label)}</span>
+                  <span className={css.gradeAns}>{t('block.yourAnswer')}{renderInline(entry)}</span>
                 </div>
               )
             }
             const isCorrect = entry === correct
             return (
-              <div key={g} className={`${css.gradeItem} ${isCorrect ? css.gradeItemOk : css.gradeItemNo}`}>
-                <span className={css.gradeQ}>{m.label}</span>
+              <div key={m.key} className={`${css.gradeItem} ${isCorrect ? css.gradeItemOk : css.gradeItemNo}`}>
+                <span className={css.gradeQ}>{renderInline(m.label)}</span>
                 <span className={css.gradeTag}>{isCorrect ? '✓' : '✗'}</span>
                 <span className={css.gradeAns}>
-                  你的答案：{entry}
-                  {!isCorrect && <span className={css.gradeRight}> 正确答案：{correct}</span>}
+                  {t('block.yourAnswer')}{renderInline(entry)}
+                  {!isCorrect && <span className={css.gradeRight}>{t('block.correctAnswer')}{renderInline(correct ?? '')}</span>}
                 </span>
-                {m.explanation !== undefined && <span className={css.gradeExp}>{m.explanation}</span>}
+                {m.explanation !== undefined && <span className={css.gradeExp}>{renderInline(m.explanation)}</span>}
               </div>
             )
           })}
@@ -170,7 +161,7 @@ export function SubmitNode({ node, onAction, answers }: {
             }
           }}
         >
-          重新作答
+          {t('block.quizRetry')}
         </button>
       </div>
     )
@@ -183,7 +174,7 @@ export function SubmitNode({ node, onAction, answers }: {
         className={`${css.button} ${css.primary} ${css.submit}`}
         disabled={!ready}
         onClick={ready ? () => {
-          if (canGradeLocally) {
+          if (shouldGradeLocally) {
             // Local grading: immediate in-place result, no model round trip.
             answers?.setLocked(true)
           } else if (node.action !== undefined && onAction !== undefined) {
@@ -191,7 +182,7 @@ export function SubmitNode({ node, onAction, answers }: {
             // the optional-action type honest.
             onAction(node.action, {
               type: 'submit',
-              answers: recorded,
+              answers: collectedAnswers,
               ...(Object.keys(filledFields).length > 0 ? { fields: filledFields } : {}),
               total,
               answered,
@@ -199,9 +190,9 @@ export function SubmitNode({ node, onAction, answers }: {
           }
         } : undefined}
       >
-        {node.label}
+        {renderInline(node.label, false)}
       </button>
-      {total > 0 && <span className={css.submitHint} aria-live="polite">已选 {answered}/{total}</span>}
+      {total > 0 && <span className={css.submitHint} aria-live="polite">{t('block.selectedCount', { answered, total })}</span>}
     </div>
   )
 }
@@ -212,7 +203,7 @@ export function SwitchNode({ node, onAction }: { node: GenuiSwitch; onAction?: G
   const action = node.action
   return (
     <label className={css.switchRow}>
-      <span className={css.switchLabel}>{node.label}</span>
+      <span className={css.switchLabel}>{renderInline(node.label, false)}</span>
       <button
         type="button"
         role="switch"
@@ -261,7 +252,7 @@ export function SliderNode({ node, onAction, answers }: {
   }
   return (
     <label className={css.sliderRow}>
-      {node.label !== undefined && <span className={css.fieldLabel}>{node.label}</span>}
+      {node.label !== undefined && <span className={css.fieldLabel}>{renderInline(node.label, false)}</span>}
       <input
         type="range"
         className={css.sliderInput}
@@ -333,6 +324,7 @@ export function SelectNode({ node, onAction, answers }: {
   onAction?: GenuiBlockProps['onAction']
   answers?: AnswersState | undefined
 }) {
+  const t = useT()
   const action = node.action
   const id = node.id
   const options = node.options.slice(0, GENUI_LIMITS.maxOptions)
@@ -362,7 +354,7 @@ export function SelectNode({ node, onAction, answers }: {
   }
   return (
     <label className={css.field}>
-      {node.label !== undefined && <span>{node.label}</span>}
+      {node.label !== undefined && <span>{renderInline(node.label, false)}</span>}
       <select
         className={css.select}
         value={value ?? ''}
@@ -373,7 +365,7 @@ export function SelectNode({ node, onAction, answers }: {
           send(v)
         }}
       >
-        {value === null && <option value="" hidden disabled>请选择…</option>}
+        {value === null && <option value="" hidden disabled>{t('block.selectPlaceholder')}</option>}
         {options.map((o, i) => <option key={i} value={o}>{o}</option>)}
       </select>
     </label>
@@ -396,11 +388,16 @@ export function InputNode({ node, onAction, answers }: {
   const action = node.action
   const id = node.id
   const secret = node.inputType === 'password'
-  // Initial value: spec default, else durable state (restored after refresh).
-  // Secrets restore as blank: a password that survives a refresh would be a
-  // stored secret, which is exactly what the boundary forbids.
-  const [value, setValue] = useState<string>(() =>
-    secret ? '' : (node.value ?? (id !== undefined ? answers?.fields[id] ?? '' : '')))
+  const restored = !secret && id !== undefined ? answers?.fields[id] : undefined
+  // Initial value: durable state wins over the spec default. Secrets always
+  // restore as blank so a password can never survive a refresh.
+  const [value, setValue] = useState<string>(() => {
+    const initial = secret ? '' : (restored ?? node.value ?? '')
+    // Match the native color input's opaque hex value, including its black default.
+    return node.inputType === 'color'
+      ? /^#[0-9a-f]{6}$/i.test(initial) ? initial.toLowerCase() : '#000000'
+      : initial
+  })
   // Last value actually DELIVERED to the model: blur only sends when the
   // value changed since the last delivery (a focus-in/focus-out with no edit
   // used to fire a pointless action round trip). Seeded with the mount value
@@ -413,13 +410,13 @@ export function InputNode({ node, onAction, answers }: {
     }
   }
   const ime = useImeComposing()
-  // Field invariant: a spec-provided non-blank default registers at mount.
+  // Register the displayed initial value, including the native color default.
   const mounted = useRef(false)
   useEffect(() => {
     if (mounted.current) return
     mounted.current = true
-    if (!secret && id !== undefined && node.value !== undefined && node.value.trim() !== '') {
-      answers?.setField(id, node.value)
+    if (!secret && id !== undefined && value.trim() !== '') {
+      answers?.setField(id, value)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -430,10 +427,18 @@ export function InputNode({ node, onAction, answers }: {
   }, [secret, id])
   return (
     <label className={css.field}>
-      {node.label !== undefined && <span>{node.label}</span>}
+      {node.label !== undefined && <span>{renderInline(node.label, false)}</span>}
       <input
         className={css.input}
         type={node.inputType ?? 'text'}
+        style={node.inputType === 'color' ? {
+          width: 64,
+          height: 40,
+          padding: 4,
+          boxSizing: 'border-box',
+          alignSelf: 'flex-start',
+          cursor: 'pointer',
+        } : undefined}
         placeholder={node.placeholder}
         value={value}
         onChange={e => {
@@ -468,8 +473,9 @@ export function TextareaNode({ node, onAction, answers }: {
 }) {
   const action = node.action
   const id = node.id
-  const [value, setValue] = useState<string>(() =>
-    node.value ?? (id !== undefined ? answers?.fields[id] ?? '' : ''))
+  // Durable state wins over the spec default (same contract as InputNode).
+  const restored = id !== undefined ? answers?.fields[id] : undefined
+  const [value, setValue] = useState<string>(() => restored ?? node.value ?? '')
   // Last value delivered to the model: blur sends only on change. Seeded
   // with the mount value so an unedited blur stays silent.
   const lastSent = useRef<string | null>(value)
@@ -480,19 +486,21 @@ export function TextareaNode({ node, onAction, answers }: {
     }
   }
   const ime = useImeComposing()
-  // Field invariant: a spec-provided non-blank default registers at mount.
+  // Field invariant: a non-blank initial value registers at mount. When a
+  // durable value was restored, registering it is a no-op (setField dedupes);
+  // otherwise the spec default registers — never the other way around.
   const mounted = useRef(false)
   useEffect(() => {
     if (mounted.current) return
     mounted.current = true
-    if (id !== undefined && node.value !== undefined && node.value.trim() !== '') {
-      answers?.setField(id, node.value)
+    if (id !== undefined && value.trim() !== '') {
+      answers?.setField(id, value)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
   return (
     <label className={css.field}>
-      {node.label !== undefined && <span>{node.label}</span>}
+      {node.label !== undefined && <span>{renderInline(node.label, false)}</span>}
       <textarea
         className={css.textarea}
         placeholder={node.placeholder}

@@ -1,24 +1,13 @@
-/**
- * Test setup: register the dsh-ui fence renderer exactly like the cordis
- * client entry does, so MarkdownText renders fences in jsdom — but ONLY when
- * the host under test ships the fence-registry extension point (contract
- * line). On pristine hosts the registry does not exist and the MarkdownText
- * fence integration tests skip themselves; the DOM channel has its own spec.
- * Also stubs requestAnimationFrame for the staggered-reveal animation and
- * SVG measure APIs jsdom lacks.
- */
-import * as primitives from '@deepseek-ai/dsh-client-ui-primitives'
-import { renderGenuiFence } from '../src/client/index.tsx'
+/** Browser API polyfills for the test environment. */
+import { setLocale } from '../src/client/i18n/index.ts'
 
-type HostFenceExt = {
-  registerFenceRenderer?: (lang: string, renderer: (raw: string, key: unknown, context?: unknown) => unknown) => () => void
-}
-
-export const hasFenceRegistry: boolean = typeof (primitives as unknown as HostFenceExt).registerFenceRenderer === 'function'
-
-if (hasFenceRegistry) {
-  ;(primitives as unknown as HostFenceExt).registerFenceRenderer!('dsh-ui', renderGenuiFence as never)
-}
+// Locale pin: jsdom reports an English navigator, so the renderer would
+// default to `en`. The suite's existing expectations were written against the
+// Chinese chrome that shipped before the i18n extraction, so pinning `zh`
+// keeps every one of them meaningful — they now assert that the zh dictionary
+// still reproduces the pre-extraction wording verbatim. English rendering and
+// locale switching are covered explicitly in tests/i18n.spec.ts.
+setLocale('zh')
 
 // jsdom lacks rAF: the reveal animation uses it per item; manual tick below.
 if (typeof globalThis.requestAnimationFrame !== 'function') {

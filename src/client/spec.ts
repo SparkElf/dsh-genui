@@ -8,9 +8,16 @@
  * v1 interactivity is client-side only: buttons, tabs, checkboxes, and inputs
  * are operable, but events do NOT flow back to the model.
  */
+import { COMPONENT_SCHEMAS, GENUI_NATIVE_TYPES } from './genui-runtime/schema.ts'
 
 /** One node in the component tree. */
-export type GenuiNode =
+/** Layout hints accepted by every node: `span` is how many columns the node
+ *  occupies as a direct child of a `grid` (bento layouts). */
+export interface GenuiLayoutHints {
+  span?: number
+}
+
+export type GenuiNode = (
   | GenuiText
   | GenuiRow
   | GenuiCol
@@ -26,6 +33,7 @@ export type GenuiNode =
   | GenuiVideo
   | GenuiBadge
   | GenuiStat
+  | GenuiHero
   | GenuiProgress
   | GenuiDivider
   | GenuiList
@@ -49,12 +57,14 @@ export type GenuiNode =
   | GenuiAccordion
   | GenuiCopy
   | GenuiMermaid
+  | GenuiSvg
   | GenuiScene3D
   | GenuiTimeline
   | GenuiFileTree
   | GenuiBreadcrumb
   | GenuiQuiz
   | GenuiDiagram
+) & GenuiLayoutHints
 
   | GenuiEChart
 
@@ -104,7 +114,7 @@ export interface GenuiInput {
   label?: string
   placeholder?: string
   value?: string
-  inputType?: 'text' | 'email' | 'password'
+  inputType?: 'text' | 'email' | 'password' | 'color'
   /** v2: when set, interaction sends this action back to the model. */
   action?: string
   /**
@@ -139,6 +149,12 @@ export interface GenuiCheckbox {
   checked?: boolean
   /** v2: when set, interaction sends this action back to the model. */
   action?: string
+  /**
+   * Aggregation group name. When set, toggles stay local and update the
+   * block-wide multi-answer registry instead of firing the per-click action;
+   * a sibling `submit` collects the selected labels as a string array.
+   */
+  group?: string
 }
 
 export interface GenuiLink {
@@ -188,19 +204,41 @@ export interface GenuiBadge {
   icon?: string
 }
 
+/** Cover band: the answer's focal point. One per fence — an eyebrow label, an
+ *  oversized metric, a title and a subtitle on a soft tinted surface. */
+export interface GenuiHero {
+  type: 'hero'
+  title: string
+  subtitle?: string
+  /** Oversized metric, e.g. "99.96%" / "3.2x". */
+  value?: string
+  /** Eyebrow label above the metric. */
+  label?: string
+  delta?: string
+  spark?: number[]
+  tone?: 'accent' | 'success' | 'warning' | 'danger'
+}
+
 export interface GenuiStat {
   type: 'stat'
   label: string
   value: string
   delta?: string
+  /** Optional micro trend line (finite numbers, 2..60 points). */
+  spark?: number[]
+  /** `hero` renders one oversized number — use it once per fence as the anchor. */
+  size?: 'hero'
 }
 
 export interface GenuiProgress {
   type: 'progress'
-  label?: string
-  /** 0..100 */
   value: number
+  label?: string
   valueLabel?: string
+  /** `bar` (default) draws a track; `ring` draws a circular gauge. */
+  variant?: 'bar' | 'ring'
+  /** Optional target marker on the bar track (0-100). */
+  target?: number
 }
 
 export interface GenuiDivider {
@@ -241,11 +279,17 @@ export interface GenuiGrid {
 export interface GenuiCard {
   type: 'card'
   title?: string
+  /** Semantic tint for the card surface (default: neutral). */
+  tone?: 'info' | 'success' | 'warning' | 'danger'
+  /** Explicit accent (hex) driving the border, title and wash. */
+  accent?: string
   items: GenuiNode[]
 }
 
 export interface GenuiList {
   type: 'list'
+  /** Field id of an input/select: its value filters the items locally. */
+  filter?: string
   items: Array<string | { title: string; desc?: string } | GenuiNode>
 }
 
@@ -253,7 +297,30 @@ export interface GenuiTable {
   type: 'table'
   columns: string[]
   rows: Array<Array<string | number>>
+  /** Per-column cell type; missing = auto (numeric right-align, signed delta). */
+  types?: TableCellType[]
+  /** Append a 合计 footer row (numeric columns are summed). */
+  total?: boolean
+  /** Show 复制 Markdown / 复制 CSV chips above the table. */
+  export?: boolean
+  /** Optional master-detail payload, positionally aligned with `rows`:
+   *  `details[i]` is what row i expands into (omit / empty = not expandable). */
+  details?: Array<GenuiNode[] | null>
+  /** Field id of an input/select: its live value filters the rows locally
+   *  (substring match), so the table is searchable without a model round trip. */
+  filter?: string
+  /** Restrict `filter` to one column index (default: every column). */
+  filterColumn?: number
+  /** Field id of a select whose value is a column header: sorts by it locally. */
+  sortField?: string
 }
+
+/** How a table column's cells render.
+ *  - `bar` / `ring`: the cell is read as 0-100
+ *  - `spark`: the cell is a number list ("3,5,4,8") drawn as a mini trend
+ *  - `index`: the 1-based row number (cell content is ignored)
+ *  - `delta` / `num` / `badge` / `text`: text treatments. */
+export type TableCellType = 'text' | 'num' | 'delta' | 'bar' | 'badge' | 'spark' | 'ring' | 'index' | 'group'
 
 export interface GenuiChartDatum {
   label: string
@@ -266,8 +333,16 @@ export interface GenuiChart {
   /** Chart shape: bars (default), line (trend), donut (share). */
   kind?: 'bars' | 'line' | 'donut'
   data: GenuiChartDatum[]
-  /** Multi-series grouped bars: one series of data per entry. */
+  /** Multi-series: grouped bars, or one line per entry when kind is line. */
   series?: Array<{ label: string; color?: string; data: GenuiChartDatum[] }>
+  /** Bars only: horizontal bars (rankings, long category labels). */
+  horizontal?: boolean
+  /** Bars + series: stack the series instead of grouping them. */
+  stacked?: boolean
+  /** Explicit categorical palette (hex) — overrides the host theme colours. */
+  palette?: string[]
+  /** Field id of an input/select: its value filters the categories locally. */
+  filter?: string
 }
 
 export interface GenuiTab {
@@ -396,23 +471,13 @@ export interface GenuiRadio {
   explanation?: string
 }
 
-/** Submit node: collects the answers of sibling `radio` groups in this block.
- * LOCAL-FIRST: when the questions carry `answer` data the click grades IN
- * PLACE — score, per-question right/wrong, explanations — with no model
- * round trip, and locks the questions until "重新作答" resets them. Only when
- * NO question carries answers does it fall back to firing ONE action
- * (`{type:'submit', answers, total, answered}`). */
+/** 提交节点收集当前 block 的答案和字段值；纯 radio 范围可在本地判卷。 */
 export interface GenuiSubmit {
   type: 'submit'
   label: string
   /**
-   * Optional action name. Local-first: when ANY question in scope carries
-   * `answer` data the click grades IN PLACE with zero model round trip, so
-   * no action is needed — the spec stays valid without one. Only when NO
-   * question has local answers does the submit need an action to collect
-   * `{type:'submit', answers, total, answered}`; without one the button
-   * renders disabled (honest affordance). Also fired as the reset hook if
-   * `resetAction` is absent.
+   * 可选 action 名称。纯 radio 范围满足本地判卷条件时无需 action；其他提交
+   * 通过 action 发送 `answers`、可选的 `fields`、`total` 和 `answered`。
    */
   action?: string
   /**
@@ -422,10 +487,11 @@ export interface GenuiSubmit {
    */
   resetAction?: string
   /**
-   * Optional explicit group list to wait for; when absent the submit enables
-   * once at least one grouped radio has an answer. When present it stays
-   * disabled until EVERY listed group has a recorded answer (the hint shows
-   * the progress).
+   * `groups` 引用当前 block 中的 submission member key，来源为 radio.group、
+   * checkbox.group 以及 input/textarea/select/slider.id。radio 需已选择，
+   * checkbox 需至少选择一项，普通 field 需在 trim 后非空。`groups` 控制提交
+   * 所需成员与完成进度；payload 仍收集当前 block 中已填写的表单状态。
+   * 未设置时，只要存在至少一个已完成成员即可提交。
    */
   groups?: string[]
 }
@@ -490,6 +556,14 @@ export interface GenuiCopy {
 }
 
 /* ---------------- v1.3: advanced ---------------- */
+
+export interface GenuiSvg {
+  type: 'svg'
+  /** Standalone SVG document, displayed in an isolated image context. */
+  code: string
+  title?: string
+  height?: number
+}
 
 /** Mermaid diagram: flowchart/sequence/class/gantt source rendered lazily. */
 export interface GenuiMermaid {
@@ -691,7 +765,9 @@ export interface GenuiDiagram {
 
 /** Preset chart kinds the `echart` node can build from `data`/`series` without
  * a full ECharts option. Each maps to a themed option template. */
-export type EChartPreset = 'bar' | 'line' | 'area' | 'pie' | 'scatter'
+export type EChartPreset =
+  | 'bar' | 'line' | 'area' | 'pie' | 'scatter'
+  | 'radar' | 'gauge' | 'funnel' | 'treemap' | 'sankey' | 'graph' | 'heatmap' | 'bigline' | 'wordCloud'
 
 /** ECharts node: renders a full ECharts chart. Two modes:
  *
@@ -720,6 +796,10 @@ export interface GenuiEChart {
   data?: GenuiChartDatum[]
   /** Multi-series for preset mode (same shape as `chart.series`). */
   series?: Array<{ label: string; color?: string; data: GenuiChartDatum[] }>
+  /** Node/edge data for the `sankey` and `graph` presets. */
+  links?: Array<{ from: string; to: string; value?: number }>
+  /** Explicit categorical palette (hex) for preset mode. */
+  palette?: string[]
   /** Full ECharts option object. When present, `preset`/`data`/`series` are
    * ignored. This is a pass-through to `echarts.setOption`. */
   option?: Record<string, unknown>
@@ -738,35 +818,76 @@ export function parseGenuiSpec(raw: string): GenuiSpec | null {
   if (isGenuiSpec(value)) return value
   // Single-component roots are part of the documented fence vocabulary
   // (e.g. {"type":"callout","tone":"info","title":"…","content":"…"} as the
-  // whole body) — wrap them into a col so the items-gated pipeline renders
-  // them. panel/append hoist onto the wrapper so panel routing keeps working.
+  // whole body) — wrap them into a one-item spec so the items-gated pipeline
+  // renders them. panel/append hoist onto the wrapper so panel routing keeps
+  // working.
   return wrapSingleComponentRoot(value)
 }
 
 /**
- * Wrap a bare component object into a col root. Returns null when `value` is
- * not component-shaped (no usable `type`). `panel`/`append` live on the root
- * spec, so they are hoisted onto the wrapper.
+ * Is `value` a bare component root rather than an envelope spec?
+ *
+ * A root object carrying a `type` is the documented single-component
+ * shorthand. `items` alone cannot decide the root shape: for container
+ * components it holds children (row/col/grid/card/accordion) and for data
+ * components it holds records (steps/list/timeline/file-tree/breadcrumb), so
+ * both readings are components. A whitelisted `type` therefore wins over the
+ * envelope reading — `{"type":"steps","items":[{"title":"…"}]}` is a bare
+ * steps node, never a spec whose `items` are the step records (issue #172).
+ * A non-native `type` keeps the envelope reading, so a stray `type` field
+ * (`{"type":"genui","items":[…]}`) cannot swallow a real spec root.
+ */
+export function isComponentRoot(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as { type?: unknown; items?: unknown }
+  if (typeof v.type !== 'string' || v.type === '') return false
+  if (!Array.isArray(v.items)) return true
+  return GENUI_NATIVE_TYPES.has(v.type)
+}
+
+/**
+ * Wrap a bare component object into a one-item spec. Returns null when
+ * `value` is not component-shaped (no usable `type`). Root-level spec fields
+ * found on the component are hoisted onto the wrapper: `panel`/`append` (so
+ * panel routing keeps working) and `title` when the component has no title of
+ * its own (`{"type":"steps","title":"…"}` means a titled block, not a steps
+ * field the schema would drop).
+ *
+ * The wrapper is a plain spec rather than a `col` node: a spec root is
+ * already rendered as a column by GenuiBlock, and leaving the wrapper free of
+ * a component `type` is what stops the guard from reading it as one more bare
+ * component root and nesting every fence inside a second column (issue #172).
  */
 export function wrapSingleComponentRoot(value: unknown): GenuiSpec | null {
   if (typeof value !== 'object' || value === null) return null
-  const v = value as { type?: unknown; panel?: unknown; append?: unknown }
+  const v = value as { type?: unknown; title?: unknown; panel?: unknown; append?: unknown }
   if (typeof v.type !== 'string' || v.type === '') return null
-  // GenuiCol is structurally a GenuiSpec (items + optional gap); panel and
-  // append are GenuiSpec-only root flags, added after construction.
-  const wrapped: GenuiCol = {
-    type: 'col',
-    items: [value as GenuiNode],
+  const definition = GENUI_NATIVE_TYPES.has(v.type) ? COMPONENT_SCHEMAS[v.type] : undefined
+  const title = typeof v.title === 'string' && definition !== undefined && !('title' in definition.fields)
+    ? v.title
+    : undefined
+  const node: Record<string, unknown> = { ...(value as Record<string, unknown>) }
+  // The hoisted title moves to the wrapper, so the component must not keep a
+  // copy the schema would flag as an unknown field.
+  if (title !== undefined) delete node.title
+  return {
+    items: [node as unknown as GenuiNode],
+    ...(title !== undefined ? { title } : {}),
+    ...(v.panel === true ? { panel: true } : {}),
+    ...(v.append === true ? { append: true } : {}),
   }
-  const root: GenuiSpec = wrapped
-  if (v.panel === true) root.panel = true
-  if (v.append === true) root.append = true
-  return root
 }
 
-/** Basic structural guard: is this object a valid GenuiSpec? */
+/**
+ * Basic structural guard: is this object a valid GenuiSpec?
+ *
+ * A bare component root is not a spec (it is wrapped instead), so
+ * `{"type":"steps","items":[…]}` answers false and `parseGenuiSpec` routes it
+ * through `wrapSingleComponentRoot` (issue #172).
+ */
 export function isGenuiSpec(value: unknown): value is GenuiSpec {
   if (typeof value !== 'object' || value === null) return false
+  if (isComponentRoot(value)) return false
   const v = value as { items?: unknown; title?: unknown; gap?: unknown }
   if (!Array.isArray(v.items)) return false
   if (v.title !== undefined && typeof v.title !== 'string') return false

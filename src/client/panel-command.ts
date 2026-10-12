@@ -8,43 +8,52 @@
  * - `/panel` — publishes the default spec and requests the dock to expand
  *   instantly, with zero model round-trip;
  * - `/panel clear` (off/close) — empties the panel so the dock retracts;
- * - `/panel <指令>` — shows the default spec for immediate feedback, then
- *   relays the instruction to the model, which replaces the panel with
+ * - `/panel <instruction>` — shows the default spec for immediate feedback,
+ *   then relays the instruction to the model, which replaces the panel with
  *   content tailored to the request (panel:true fence).
- * Panel updates afterwards still flow through the model (say "更新面板" or
- * re-run render_ui) or through another /panel.
+ * Panel updates afterwards still flow through the model (say "update the
+ * panel", or re-run render_ui) or through another /panel.
  */
 import type { InputTriggerSource } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
-import type { ClientContext, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { GenuiSpec } from './spec.ts'
 import { requestPanelExpand, setLocalPanel } from './panel-store.ts'
+import { t } from './i18n/index.ts'
 
-/** Default panel content published by `/panel`: the component overview. */
-export const DEFAULT_PANEL_SPEC: GenuiSpec = {
-  title: 'GenUI 面板',
-  items: [
-    { type: 'text', size: 'h3', content: 'GenUI 生成式界面' },
-    { type: 'text', size: 'muted', content: '面板会原地更新：对话里说「更新面板」，或再次执行 /panel 刷新。' },
-    {
-      type: 'grid', cols: 4, items: [
-        { type: 'stat', label: '组件', value: '38' },
-        { type: 'stat', label: '单个', value: '12' },
-        { type: 'stat', label: '组合', value: '8' },
-        { type: 'stat', label: '高级', value: '18' },
-      ],
-    },
-    {
-      type: 'list', items: [
-        { title: '单个 ×12', desc: 'text button input select checkbox link badge stat progress divider avatar spacer' },
-        { title: '组合 ×8', desc: 'row col grid card list table chart tabs' },
-        { title: '数据 ×7', desc: 'plot callout steps keyvalue diff json code' },
-        { title: '交互 ×5', desc: 'radio switch textarea accordion copy' },
-        { title: '高级 ×5', desc: 'mermaid scene3d timeline file-tree breadcrumb' },
-        { title: '教学 ×1', desc: 'quiz' },
-      ],
-    },
-    { type: 'callout', tone: 'info', title: '更新方式', content: '对话说「更新面板」→ 模型输出 panel:true 围栏；/panel clear 清空面板。' },
-  ],
+/**
+ * Default panel content published by `/panel`: the component overview.
+ *
+ * Built PER CALL so the panel opens in whatever language is active now,
+ * rather than the one that happened to be active at module load.
+ */
+export function defaultPanelSpec(): GenuiSpec {
+  return {
+    title: t('panel.title.default'),
+    items: [
+      { type: 'text', size: 'h3', content: t('panel.default.heading') },
+      { type: 'text', size: 'muted', content: t('panel.default.subtitle') },
+      {
+        type: 'grid', cols: 4, items: [
+          { type: 'stat', label: t('panel.default.stat.components'), value: '38' },
+          { type: 'stat', label: t('panel.default.stat.single'), value: '12' },
+          { type: 'stat', label: t('panel.default.stat.composite'), value: '8' },
+          { type: 'stat', label: t('panel.default.stat.advanced'), value: '18' },
+        ],
+      },
+      {
+        type: 'list', items: [
+          { title: t('panel.default.group.single'), desc: 'text button input select checkbox link badge stat progress divider avatar spacer' },
+          { title: t('panel.default.group.composite'), desc: 'row col grid card list table chart tabs' },
+          { title: t('panel.default.group.data'), desc: 'plot callout steps keyvalue diff json code' },
+          { title: t('panel.default.group.interactive'), desc: 'radio switch textarea accordion copy' },
+          { title: t('panel.default.group.advanced'), desc: 'mermaid scene3d timeline file-tree breadcrumb' },
+          { title: t('panel.default.group.teaching'), desc: 'quiz' },
+        ],
+      },
+      { type: 'callout', tone: 'info', title: t('panel.default.callout.title'), content: t('panel.default.callout.body') },
+    ],
+  }
 }
 
 /** Shared command application: apply the local override (default panel +
@@ -57,7 +66,7 @@ function applyPanelCommand(sessionId: string, args: string): void {
     setLocalPanel(sessionId, null)
     return
   }
-  setLocalPanel(sessionId, DEFAULT_PANEL_SPEC)
+  setLocalPanel(sessionId, defaultPanelSpec())
   requestPanelExpand(sessionId)
 }
 
@@ -70,8 +79,9 @@ function applyPanelCommand(sessionId: string, args: string): void {
  */
 function panelClaim(sessionId: SessionId, sendInstruction: (sessionId: SessionId, instruction: string) => void) {
   return {
+    name: 'panel',
     token: '/panel',
-    hint: '开启 GenUI 面板；/panel <指令> 让模型定制；/panel clear 清空',
+    hint: t('panel.cmd.hint'),
     submit: async (args: string, _actx: ClientContext) => {
       const instruction = args.trim()
       if (instruction === '' ) {
@@ -103,11 +113,20 @@ export function createPanelSlashSource(sendInstruction: (sessionId: SessionId, i
     trigger: '/',
     name: 'genui',
     order: 60,
-    candidates: async (_session, _req) => [{
-      name: 'panel',
-      description: '开启 GenUI 面板（/panel clear 清空；/panel <指令> 定制内容）',
-      hint: '/panel',
-    }],
+    candidates: async (_session, req) => {
+      // Filter by query prefix: once the user types past "panel" the genui
+      // group must disappear. Unfiltered candidates kept this group the only
+      // ready non-empty group for unmatched queries, so the menu's default
+      // highlight fell through to `panel` and Enter picked it instead of the
+      // intended command/skill candidate.
+      const query = req.query.toLowerCase()
+      if (query !== '' && !'panel'.startsWith(query)) return []
+      return [{
+        name: 'panel',
+        description: t('panel.cmd.description'),
+        hint: '/panel',
+      }]
+    },
     onPick(pick) {
       return { claim: panelClaim(pick.session.sessionId, sendInstruction) }
     },
