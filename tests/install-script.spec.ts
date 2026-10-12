@@ -39,11 +39,11 @@ function makeEnv(): Env {
   // simulated installed package (no exports map → legacy subpath resolve)
   const pkg = join(profile, 'node_modules', '@changfenhuang', 'dsh-genui')
   mkdirSync(pkg, { recursive: true })
-  writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: '@changfenhuang/dsh-genui', version: '0.0.0-test' }))
+  writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: '@sparkelf/dsh-genui', version: '0.0.0-test' }))
   writeFileSync(join(pkg, 'SKILL.md'), PACKAGE_SKILL)
   // profile already lists the plugin → idempotent branch → sync_skill only
   mkdirSync(profile, { recursive: true })
-  writeFileSync(join(profile, 'package.json'), '{"name":"web","dependencies":{"@changfenhuang/dsh-genui":"link:whatever"}}\n')
+  writeFileSync(join(profile, 'package.json'), '{"name":"web","dependencies":{"@sparkelf/dsh-genui":"link:whatever"}}\n')
   const dest = join(home, 'skills', 'genui', 'SKILL.md')
   const agentsDest = join(agentsHome, 'skills', 'genui', 'SKILL.md')
   const run: Env['run'] = (profileArg = 'web') => {
