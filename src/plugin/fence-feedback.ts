@@ -34,7 +34,7 @@ import { droppedNodeFailure } from './genui-diagnostic.ts'
 import { resolveFence } from '../shared/fence-resolve.ts'
 
 /** Plugin name recorded on every message this loop steers. */
-export const FEEDBACK_PLUGIN_NAME = '@changfenhuang/dsh-genui'
+export const FEEDBACK_PLUGIN_NAME = '@sparkelf/dsh-genui'
 /** Source kind persisted by this plugin in Session format v4. */
 export const FEEDBACK_SOURCE_KIND = `plugin:${FEEDBACK_PLUGIN_NAME}` as const
 

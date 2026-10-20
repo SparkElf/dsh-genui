@@ -35,7 +35,7 @@ import { installFenceFeedback } from './fence-feedback.ts'
  */
 
 /** Route prefix under /plugins; anything under it is this plugin's asset. */
-const ASSET_ROUTE_PATH = '/plugins/@changfenhuang/dsh-genui/assets'
+const ASSET_ROUTE_PATH = '/plugins/@sparkelf/dsh-genui/assets'
 
 /** Safe flat file names only: no slashes, no traversal, js assets only. */
 const ASSET_FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\.js$/
@@ -138,7 +138,7 @@ ${RENDER_UI_TOOL_GUIDANCE}
 // plugin — hosts without tool access keep the fence channel working. Cordis
 // inject entries are hard requirements, so the registry is probed at runtime
 // instead (see apply).
-export const name = '@changfenhuang/dsh-genui'
+export const name = '@sparkelf/dsh-genui'
 export const inject = ['systemPrompt']
 
 const BUNDLED_SKILL_RANK = 600

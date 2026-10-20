@@ -1,6 +1,6 @@
 /**
  * 使用浏览器 renderer 与 Node 侧最终回复反馈守卫共用的流程解析 dsh-ui 围栏正文。
- * @module @changfenhuang/dsh-genui/shared/fence-resolve
+ * @module @sparkelf/dsh-genui/shared/fence-resolve
  */
 
 import { partialRepairGenuiSpec, processGenuiSpec, type GenuiProcessResult } from '../client/guard.ts'
