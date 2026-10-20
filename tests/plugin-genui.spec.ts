@@ -6,6 +6,8 @@ import SkillRegistry from '@deepseek-ai/dsh-skill'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import * as GenUI from '../src/plugin/index.ts'
 
+import { COMPONENT_SCHEMAS } from '../src/client/genui-runtime/schema.ts'
+
 /** Boot the plugin and return the assembled system-prompt sections. */
 async function assemble() {
   const ctx = new Context()
@@ -14,15 +16,15 @@ async function assemble() {
   return ctx.systemPrompt.assemble({})
 }
 
-/** The complete whitelist the slim fence section must still advertise. */
-const WHITELISTED_COMPONENT_TYPES = [
-  'text', 'row', 'col', 'grid', 'card',
-  'button', 'input', 'textarea', 'select', 'checkbox', 'switch', 'slider', 'radio', 'submit', 'quiz', 'link',
-  'badge', 'stat', 'progress', 'divider', 'spacer', 'list', 'table', 'audio', 'video',
-  'chart', 'tabs', 'accordion', 'avatar', 'plot', 'callout', 'steps',
-  'keyvalue', 'json', 'code', 'diff', 'copy',
-  'mermaid', 'scene3d', 'timeline', 'file-tree', 'breadcrumb',
-] as const
+/**
+ * The complete whitelist the slim fence section must still advertise.
+ *
+ * Derived from COMPONENT_SCHEMAS rather than hand-copied: the previous literal
+ * had drifted behind the schema (hero / image / icon / blocks / arrow / echart /
+ * diagram / svg were all missing), so the gate stayed green while the prompt
+ * went stale. Any future node type now fails this test until it is advertised.
+ */
+const WHITELISTED_COMPONENT_TYPES: readonly string[] = Object.keys(COMPONENT_SCHEMAS)
 
 const BROKEN_FENCE_REPLY = '```dsh-ui\n{"items":[{"type":"stat"}]}\n```'
 
@@ -80,6 +82,12 @@ describe('genui:fence section', () => {
     expect(text).toContain('never emit these placeholders literally')
     expect(text).toContain('Tool channel: render_ui')
     expect(text).not.toContain('"title":"可选标题"')
+    for (const type of ['stat', 'table', 'progress', 'keyvalue', 'steps', 'file-tree', 'callout']) {
+      expect(text).toContain(`{"type":"${type}"`)
+    }
+    expect(text).toContain('组件节点必须带字符串')
+    expect(text).toContain('file-tree')
+    expect(text).toContain('file-tree.items[].type` 表示 `file` 或 `dir`')
   })
 
   it('omits render_ui guidance from the system prompt when the tool is disabled', async () => {
