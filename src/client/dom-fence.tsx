@@ -67,7 +67,8 @@ import { resolveViewedSessionId } from './session-resolver.ts'
 import { validateCanonicalGenuiSpec } from './guard.ts'
 import { diagnoseUnknownGenuiFields } from './genui-runtime/diagnostics.ts'
 import { normalizeGenuiSpec } from './genui-runtime/normalize.ts'
-import { normalizeFenceLanguage, sourceFencesOfAssistant, sourceLanguageAt } from './source-fence.ts'
+import { sourceFencesOfAssistant, sourceLanguageAt } from './source-fence.ts'
+import { normalizeFenceLanguage } from '../shared/fence-language.ts'
 
 /** 优先用宿主代码块内容的语义标记定位包装节点；隐藏语言或改变类名不能阻断
  * 原始消息的围栏识别。类名也用于仍以这些表面呈现的代码块。 */
@@ -248,7 +249,7 @@ function infostringOf(block: Element): 'dsh-ui' | 'svg' | null {
   const pre = block.querySelector('pre')
   for (const el of block.querySelectorAll('*')) {
     if (el.childElementCount !== 0) continue
-    const lang = el.textContent?.trim()
+    const lang = normalizeFenceLanguage(el.textContent?.trim() ?? '')
     if (lang !== 'dsh-ui' && lang !== 'svg') continue
     if (pre !== null && pre.contains(el)) continue
     // A leaf label that belongs to a NESTED known code surface is that
@@ -288,13 +289,15 @@ const KNOWN_LANGUAGE_LABELS = new Set([
 /**
  * Read a language that the host still exposes in its CodeBlock banner.
  *
- * 只有标签命中 {@link KNOWN_LANGUAGE_LABELS} 才返回语言；空标签与本地化通用词
+ * 先规范化 GenUI 标签，再识别已知语言与明确的 `dsh-ui-*` 变体；空标签与本地化通用词
  * （«Код» / Código / 代码块 …）是宿主的**呈现文案**、不是语义，一律返回 null——
  * 此前它们会被当成真语言，连 ChatSnapshot 来源都被短路（issue #258）。
  */
 function domLanguageOf(block: Element): string | null {
-  const label = labelTextOf(block)
-  return label !== '' && KNOWN_LANGUAGE_LABELS.has(label.toLowerCase()) ? label : null
+  const label = normalizeFenceLanguage(labelTextOf(block))
+  // An explicit GenUI-like language that normalization did not accept is not
+  // a localized generic banner; never recover it from JSON-shaped content.
+  return label.toLowerCase().startsWith('dsh-ui') || KNOWN_LANGUAGE_LABELS.has(label.toLowerCase()) ? label : null
 }
 
 /**
@@ -316,7 +319,7 @@ function resolveFenceLanguage(
   sourceLanguage: (block: Element) => string | null | undefined,
 ): string | null | undefined {
   const domLanguage = tagTextBodyOf(block) !== null ? 'dsh-ui' : domLanguageOf(block)
-  const language = domLanguage ?? (domLanguage === null ? sourceLanguage(block) : undefined)
+  const language = domLanguage ?? sourceLanguage(block)
   return typeof language === 'string' ? normalizeFenceLanguage(language) : language
 }
 
@@ -1027,9 +1030,7 @@ export function installDomFenceRenderer(
     if (block.hasAttribute(PROCESSED)) return
     const row = rowOf(block)
     const settled = isSettled(block)
-    const domLanguage = tagTextBodyOf(block) !== null ? 'dsh-ui' : domLanguageOf(block)
-    const sourceLanguage = domLanguage === null ? sourceLanguages.get(block) : undefined
-    const language = domLanguage ?? sourceLanguage
+    const language = resolveFenceLanguage(block, candidate => sourceLanguages.get(candidate))
     const raw = rawOf(block)
     // DSH 可能在最终 DOM 隐去不支持高亮的语言；公开 ChatSnapshot 的原始 Markdown 是 language 来源。
     // 内容识别只在 source 暂不可用且 assistant 已结束时兜底，不覆盖已确认的 language 或无 language fence。

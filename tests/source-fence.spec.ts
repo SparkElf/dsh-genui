@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import type { AssistantBlock, ChatSnapshot } from '@deepseek-ai/dsh-client-ui-chat/client'
 import { hostFenceIndexOf } from '../src/client/dom-fence.tsx'
-import { isGenuiFenceLanguage, normalizeFenceLanguage, sourceFencesOf, sourceFencesOfAssistant, sourceLanguageAt } from '../src/client/source-fence.ts'
+import { sourceFencesOf, sourceFencesOfAssistant, sourceLanguageAt } from '../src/client/source-fence.ts'
+import { isGenuiFenceLanguage, normalizeFenceLanguage } from '../src/shared/fence-language.ts'
 
 describe('sourceFencesOf', () => {
   it('reads one dsh-ui fence surrounded by Markdown and ignores inline code', () => {
