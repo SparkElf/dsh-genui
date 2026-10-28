@@ -3,6 +3,7 @@ import { COMPONENT_SCHEMAS, GENUI_SPEC_SCHEMA } from './schema.ts'
 import { isComponentRoot } from '../spec.ts'
 import type { ComponentRecordSchema, ComponentSchema } from './schema.ts'
 import { isTableDetailReachable } from '../table-details.ts'
+import { GENUI_LIMITS } from './limits.ts'
 
 export interface GenuiDiagnostic {
   readonly kind: 'alias' | 'unknown-field' | 'truncated'
@@ -32,8 +33,9 @@ function visitNativeNodes(value: unknown, path: string, visit: (node: Record<str
   if (definition === undefined) return
   visit(value, path, definition)
   const children = (child: unknown, childPath: string): void => visitNativeNodes(child, childPath, visit)
-  if ((type === 'row' || type === 'col' || type === 'grid' || type === 'card') && Array.isArray(value.items)) {
-    value.items.forEach((child, index) => children(child, `${path}.items[${index}]`))
+  if ((type === 'row' || type === 'col' || type === 'grid' || type === 'card' || type === 'carousel') && Array.isArray(value.items)) {
+    const items = type === 'carousel' ? value.items.slice(0, GENUI_LIMITS.maxCarouselItems) : value.items
+    items.forEach((child, index) => children(child, `${path}.items[${index}]`))
   } else if (type === 'list' && Array.isArray(value.items)) {
     value.items.forEach((child, index) => children(child, `${path}.items[${index}]`))
   } else if (type === 'tabs' && Array.isArray(value.tabs)) {
@@ -105,7 +107,12 @@ function diagnoseNestedFields(
   for (const [field, nested] of Object.entries(definition.nested)) {
     const nestedValue = node[field]
     if (Array.isArray(nestedValue)) {
-      nestedValue.forEach((item, index) => diagnoseRecordFields(item, `${path}.${field}[${index}]`, nested, node.type as string, warnings))
+      const items = node.type === 'image-group' && field === 'items'
+        ? nestedValue.slice(0, GENUI_LIMITS.maxImageGroupItems)
+        : node.type === 'map' && field === 'locations' ? nestedValue.slice(0, GENUI_LIMITS.maxMapLocations)
+        : node.type === 'map' && field === 'routes' ? nestedValue.slice(0, GENUI_LIMITS.maxMapRoutes)
+        : nestedValue
+      items.forEach((item, index) => diagnoseRecordFields(item, `${path}.${field}[${index}]`, nested, node.type as string, warnings))
     } else if (nestedValue !== undefined) {
       diagnoseRecordFields(nestedValue, `${path}.${field}`, nested, node.type as string, warnings)
     }
@@ -147,6 +154,8 @@ export function diagnoseUnknownGenuiFields(value: unknown): GenuiDiagnostic[] {
   if (Array.isArray(root.items) && !isComponentRoot(root)) {
     for (const field of Object.keys(root)) {
       if (field in GENUI_SPEC_SCHEMA.fields) continue
+      // The optional native projection shares the envelope, never web node fields.
+      if (root.type === 'stack' && Array.isArray(root.children) && (field === 'type' || field === 'children')) continue
       pushUnknownField(warnings, 'spec', field, 'spec')
     }
     root.items.forEach((item, index) => visitNativeNodes(item, `items[${index}]`, visit))

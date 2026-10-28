@@ -1,5 +1,6 @@
 import { GENUI_LIMITS } from './genui-runtime/index.ts'
 import type { GenuiSpec } from './spec.ts'
+import { GENUI_CHECKBOX_VALUE } from './spec.ts'
 import { walkGenuiNodes } from './walk-spec.ts'
 
 export type SubmissionMember = RadioSubmissionMember | CheckboxSubmissionMember | FieldSubmissionMember
@@ -16,12 +17,14 @@ export interface RadioSubmissionMember {
 export interface CheckboxSubmissionMember {
   kind: 'checkbox'
   key: string
+  /** 来源文案模板 → 当前显示文案。 */
+  choices: Map<string, string>
 }
 
 export interface FieldSubmissionMember {
   kind: 'field'
   key: string
-  fieldType: 'input' | 'textarea' | 'select' | 'slider'
+  fieldType: 'input' | 'textarea' | 'select' | 'slider' | 'map'
   secret: boolean
 }
 
@@ -45,7 +48,7 @@ export interface ResolvedSubmitState {
 }
 
 /** 从 spec 建立成员表，并诊断 submission key 和 submit.groups。 */
-export function analyzeSubmissionRegistry(spec: GenuiSpec): { registry: SubmissionRegistry; diagnostics: string[] } {
+export function analyzeSubmissionRegistry(spec: GenuiSpec, allowExternalGroups = false): { registry: SubmissionRegistry; diagnostics: string[] } {
   const members = new Map<string, SubmissionMember>()
   const paths = new Map<string, string>()
   const diagnostics: string[] = []
@@ -64,15 +67,31 @@ export function analyzeSubmissionRegistry(spec: GenuiSpec): { registry: Submissi
         member = { kind: 'radio', key: node.group, label: node.label ?? node.group, options: node.options.slice(0, GENUI_LIMITS.maxOptions), ...(node.answer === undefined ? {} : { answer: node.answer }), ...(node.explanation === undefined ? {} : { explanation: node.explanation }) }
         keyPath = `${path}.group`
         break
+      case 'choices':
+        // A `choices` list with a `group` is a paper question: single-select,
+        // graded from `answer` exactly like `radio` — but each option keeps its
+        // cost line, which `radio`'s bare strings cannot carry.
+        if (node.group === undefined) return
+        member = {
+          kind: 'radio',
+          key: node.group,
+          label: node.title ?? node.prompt ?? node.group,
+          options: node.items.map(item => item.label).slice(0, GENUI_LIMITS.maxOptions),
+          ...(node.answer === undefined ? {} : { answer: node.answer }),
+          ...(node.explanation === undefined ? {} : { explanation: node.explanation }),
+        }
+        keyPath = `${path}.group`
+        break
       case 'checkbox':
         if (node.group === undefined) return
-        member = { kind: 'checkbox', key: node.group }
+        member = { kind: 'checkbox', key: node.group, choices: new Map([[node[GENUI_CHECKBOX_VALUE] ?? node.label, node.label]]) }
         keyPath = `${path}.group`
         break
       case 'input':
       case 'textarea':
       case 'select':
       case 'slider':
+      case 'map':
         if (node.id === undefined) return
         member = { kind: 'field', key: node.id, fieldType: node.type, secret: node.type === 'input' && node.inputType === 'password' }
         keyPath = `${path}.id`
@@ -85,6 +104,8 @@ export function analyzeSubmissionRegistry(spec: GenuiSpec): { registry: Submissi
     if (existing !== undefined) {
       if (existing.kind !== 'checkbox' || member.kind !== 'checkbox') {
         diagnostics.push(`${keyPath} conflicts with ${paths.get(member.key)}: submission key '${member.key}' is already used`)
+      } else {
+        for (const [value, label] of member.choices) existing.choices.set(value, label)
       }
       return
     }
@@ -99,8 +120,8 @@ export function analyzeSubmissionRegistry(spec: GenuiSpec): { registry: Submissi
       if (seen.has(key)) diagnostics.push(`${at}: duplicate submission member '${key}'`)
       seen.add(key)
       const member = members.get(key)
-      if (member === undefined) diagnostics.push(`${at}: submit.groups references unknown submission member '${key}'`)
-      else if (member.kind === 'field' && member.secret) diagnostics.push(`${at}: submit.groups cannot require secret field '${key}'`)
+      if (member === undefined && !allowExternalGroups) diagnostics.push(`${at}: submit.groups references unknown submission member '${key}'`)
+      else if (member?.kind === 'field' && member.secret) diagnostics.push(`${at}: submit.groups cannot require secret field '${key}'`)
     })
   }
   return { registry: { members }, diagnostics }
@@ -115,9 +136,10 @@ export function compileSubmissionRegistry(spec: GenuiSpec): SubmissionRegistry {
 export function isSubmissionMemberAnswered(member: SubmissionMember, state: SubmitInteractionState): boolean {
   switch (member.kind) {
     case 'radio': return state.answers[member.key] !== undefined
-    case 'checkbox': return (state.multiAnswers[member.key]?.length ?? 0) > 0
+    case 'checkbox': return state.multiAnswers[member.key]?.some(value => member.choices.has(value)) ?? false
     case 'field': {
       if (member.secret) return false
+      if (!Object.hasOwn(state.fields, member.key)) return false
       const value = state.fields[member.key]
       return value !== undefined && value.trim() !== ''
     }

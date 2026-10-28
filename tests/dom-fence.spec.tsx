@@ -1530,7 +1530,7 @@ describe('persisted replay barrier across page refresh (issue #4)', () => {
       const blockC = stockCodeBlock(PANEL('面板C', 'C'), 'dsh-ui')
       row4.appendChild(blockC)
       document.body.appendChild(row4)
-      await tick()
+      await waitFor(() => getPanelSpec('sess-refresh')?.title === '面板C')
       expect(getPanelSpec('sess-refresh')?.title).toBe('面板C')
     } finally {
       dispose()

@@ -29,6 +29,10 @@ export type GenuiNode = (
   | GenuiCheckbox
   | GenuiLink
   | GenuiImage
+  | GenuiImageGroup
+  | GenuiCompare
+  | GenuiChoices
+  | GenuiCarousel
   | GenuiAudio
   | GenuiVideo
   | GenuiBadge
@@ -59,6 +63,7 @@ export type GenuiNode = (
   | GenuiMermaid
   | GenuiSvg
   | GenuiScene3D
+  | GenuiMap
   | GenuiTimeline
   | GenuiFileTree
   | GenuiBreadcrumb
@@ -70,6 +75,32 @@ export type GenuiNode = (
 ) & GenuiLayoutHints
 
   | GenuiEChart
+
+/** A map is a local location picker, never an implicit action or geocoder. */
+export interface GenuiMapLocation {
+  id: string
+  label: string
+  coordinates: [number, number]
+  description?: string
+}
+export interface GenuiMapRoute {
+  id: string
+  label: string
+  /** Inline LineString, not a routing-service request. */
+  coordinates: [number, number][]
+}
+export interface GenuiMap {
+  type: 'map'
+  title?: string
+  /** Submission field holding a selected location ID, not a label. */
+  id?: string
+  locations: GenuiMapLocation[]
+  routes?: GenuiMapRoute[]
+  selected?: string
+  center?: [number, number]
+  zoom?: number
+  height?: number
+}
 
 export interface GenuiSpec {
   /** Short title shown as the card banner. */
@@ -88,8 +119,38 @@ export interface GenuiSpec {
    * Applies only when the fence body is fully complete, so a streaming
    * partial parse never double-merges. */
   append?: boolean
+  /** 根据输入字段及其他 Computed 字段计算的公式列表。 */
+  computed?: GenuiComputed[]
   /** Root component list. */
   items: GenuiNode[]
+}
+
+export interface GenuiComputedFormat {
+  locale?: string
+  style?: 'decimal' | 'currency' | 'percent'
+  currency?: string
+  minimumFractionDigits?: number
+  maximumFractionDigits?: number
+}
+
+export interface GenuiComputed {
+  id: string
+  expr: string
+  format?: GenuiComputedFormat
+}
+
+/** 数值组件数据中的 Computed 字段引用。 */
+export interface GenuiComputedRef {
+  $computed: string
+}
+
+/** 仅用于渲染阶段的表格值，排序读取原始数值，显示读取格式化文字。 */
+export const GENUI_COMPUTED_CELL = Symbol('dsh-genui-computed-cell')
+
+export interface GenuiComputedCell {
+  [GENUI_COMPUTED_CELL]: true
+  value: number
+  formatted: string
 }
 
 /* ---------------- leaf nodes ---------------- */
@@ -124,7 +185,7 @@ export interface GenuiInput {
   label?: string
   placeholder?: string
   value?: string
-  inputType?: 'text' | 'email' | 'password' | 'color'
+  inputType?: 'text' | 'email' | 'password' | 'color' | 'number'
   /** v2: when set, interaction sends this action back to the model. */
   action?: string
   /**
@@ -153,7 +214,11 @@ export interface GenuiSelect {
   id?: string
 }
 
+/** 保存计算后复选框显示文案对应的运行时身份。 */
+export const GENUI_CHECKBOX_VALUE = Symbol('dsh-genui-checkbox-value')
+
 export interface GenuiCheckbox {
+  [GENUI_CHECKBOX_VALUE]?: string
   type: 'checkbox'
   label: string
   checked?: boolean
@@ -186,6 +251,111 @@ export interface GenuiImage {
   alt?: string
   /** Caption line below the image (source, reading, credit). */
   caption?: string
+}
+
+/** A bounded, local image gallery; sources use the same policy as image. */
+export interface GenuiImageGroupItem {
+  src: string
+  alt?: string
+  caption?: string
+}
+
+export interface GenuiImageGroup {
+  type: 'image-group'
+  items: GenuiImageGroupItem[]
+  title?: string
+}
+
+/** One side of a `compare` pair. Same media policy as `image`. */
+export interface GenuiComparePanel {
+  /** http(s) or relative media URL. */
+  src: string
+  /** Visible chip above the frame — `改动前` / `改动后`, or any two labels. */
+  label?: string
+  /** Accessible description (never shown as a heading). */
+  alt?: string
+  /** Line under the frame (measurement, reading, source). */
+  caption?: string
+}
+
+/** One row in a `choices` decision list. */
+export interface GenuiChoiceItem {
+  /** What the option IS (`加一台只读副本`). */
+  label: string
+  /** One line of cost / trade-off (`多 12% 成本，读延迟降 40%`). */
+  hint?: string
+  /** Short evidence chip on the right: a number, a verdict, a SLO. */
+  meta?: string
+  /** Marks the option the analyst recommends (at most one is expected). */
+  recommended?: boolean
+  /** Rules the option out without hiding it — the reason stays visible. */
+  disabled?: boolean
+  /** Why it is unavailable; shown in place of the hint when disabled. */
+  reason?: string
+}
+
+/**
+ * A decision the reader has to MAKE, not read: pick one (or several) from a
+ * list where every option carries its own cost. Distinct from `radio`, whose
+ * options are single strings with nowhere to put a trade-off.
+ *
+ * Local-first: selection is local state; `action` (optional) sends the chosen
+ * labels back to the model only when the choice needs a follow-up.
+ */
+export interface GenuiChoices {
+  type: 'choices'
+  title?: string
+  /** The question being decided (`先做哪个？`). */
+  prompt?: string
+  /** `single` (default) = one option; `multi` = toggle several. */
+  mode?: 'single' | 'multi'
+  items: GenuiChoiceItem[]
+  /** Label of the submit button; absent = selection stays local (no round trip). */
+  submit?: string
+  /** Action fired on submit with `{ question, selected, mode }`. */
+  action?: string
+  /** `multi` cap; extra clicks are ignored instead of silently replacing. */
+  max?: number
+  /**
+   * Paper member key. With `group`, the selection joins the block's shared
+   * answers registry instead of staying local, so a sibling `submit` can
+   * collect it and grade locally — this is what retires `radio`.
+   */
+  group?: string
+  /** Correct option for LOCAL grading: index or label. */
+  answer?: number | string
+  /** Per-question explanation shown after local grading. */
+  explanation?: string
+}
+
+/**
+ * Two images shown as a pair: what changed, what was chosen, what the two
+ * options look like. Not a gallery — a `before`/`after` pair carries an order,
+ * and `mode: 'slider'` lets the reader drag a divider across one frame.
+ */
+export interface GenuiCompare {
+  type: 'compare'
+  title?: string
+  before: GenuiComparePanel
+  after: GenuiComparePanel
+  /**
+   * `side` (default) = two columns while the container is wide enough,
+   * `stack` = always vertical, `slider` = one frame with a draggable divider.
+   */
+  mode?: 'side' | 'stack' | 'slider'
+  /** Frame height cap in px (120–640, default 260). */
+  height?: number
+}
+
+/** Horizontally scrollable native nodes, retaining normal state/action scope. */
+export interface GenuiCarousel {
+  type: 'carousel'
+  items: GenuiNode[]
+  title?: string
+  /** Preferred slide width in pixels, clamped to 80–640 and 85% of the track. */
+  itemWidth?: number
+  /** Gap scale multiplied by 4 pixels; negative values become zero. */
+  gap?: number
 }
 
 /** User-controlled audio from a browser-reachable URL. */
@@ -410,7 +580,7 @@ export interface GenuiList {
 export interface GenuiTable {
   type: 'table'
   columns: string[]
-  rows: Array<Array<string | number>>
+  rows: Array<Array<string | number | GenuiComputedRef | GenuiComputedCell>>
   /** Per-column cell type; missing = auto (numeric right-align, signed delta). */
   types?: TableCellType[]
   /** Append a 合计 footer row (numeric columns are summed). */
@@ -438,7 +608,7 @@ export type TableCellType = 'text' | 'num' | 'delta' | 'bar' | 'badge' | 'spark'
 
 export interface GenuiChartDatum {
   label: string
-  value: number
+  value: number | GenuiComputedRef | null
   color?: string
 }
 
@@ -667,6 +837,10 @@ export interface GenuiCopy {
   type: 'copy'
   label?: string
   text: string
+  /** Opt in to a separate toggle and plain-text preview; defaults to false. */
+  expandable?: boolean
+  /** Collapsed preview lines (0–30); ignored unless expandable is true. */
+  previewLines?: number
 }
 
 /* ---------------- v1.3: advanced ---------------- */

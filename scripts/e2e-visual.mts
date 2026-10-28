@@ -173,7 +173,7 @@ try {
   await mkdir(OUT_DIR, { recursive: true })
 
   // ── 安装插件（link 当前工作区 = 测的就是当前代码）───────────────────────
-  // E2E_PLUGIN_SPEC 可以指向已发布版本（如 @changfenhuang/dsh-genui@0.10.0），
+  // E2E_PLUGIN_SPEC 可以指向已发布版本（如 @sparkelf/dsh-genui@0.10.0），
   // 用来在同一个画廊、同一台宿主上出一份"改动前"的真机截图做对比。
   log(`安装插件（${PLUGIN_SPEC}）...`)
   const add = spawnSync(DSH_BIN, ['plugin', '--profile', 'web', 'add', PLUGIN_SPEC], { env, stdio: 'inherit' })
@@ -227,7 +227,7 @@ try {
   const indexRes = await fetch(`${BASE}/`, { headers: sessionCookie === undefined ? {} : { cookie: sessionCookie } })
   if (!indexRes.ok) throw new Error(`index 返回 ${indexRes.status}`)
   const indexHtml = await indexRes.text()
-  if (!indexHtml.includes('@changfenhuang/dsh-genui/client.js')) {
+  if (!indexHtml.includes('@sparkelf/dsh-genui/client.js')) {
     throw new Error('genui 客户端 bundle 未出现在 boot graph 中（插件未注册 client 半边？）')
   }
   log('✓ 客户端 bundle 已在 boot graph 中')

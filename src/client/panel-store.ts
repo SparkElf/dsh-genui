@@ -20,8 +20,12 @@
  * fold depend on arrival order).
  *
  */
-import type { GenuiSpec, GenuiTab } from './spec.ts'
-import { countGenuiNodes } from './guard.ts'
+import type { GenuiSpec } from './spec.ts'
+import { countGenuiNodes, processGenuiSpec } from './guard.ts'
+import { GENUI_LIMITS } from './genui-runtime/index.ts'
+import { fingerprint } from './interaction-store.ts'
+import { mergePanelSpecs } from '../shared/panel-merge.ts'
+export { mergePanelSpecs } from '../shared/panel-merge.ts'
 
 /** Panel scale limits — adjustable defaults (design doc: scale limits are
  *  configurable, not law). Folds read the CURRENT limits, so tuning applies
@@ -57,8 +61,10 @@ export interface PanelOperation {
 /** Outcome of a fold, committed atomically. */
 interface FoldResult {
   snapshot: GenuiSpec | null
-  /** Accepted operations (latest replace + accepted appends after it). */
+  stateIdentity: string | null
+  /** 按顺序保存的操作，也包含等待更早基项的追加操作。 */
   kept: PanelOperation[]
+  invalid: Map<string, string>
   /** First append rejected by the budget, or null. */
   overflow: PanelOperation | null
   /** Highest message seq among the candidate ops. */
@@ -66,7 +72,10 @@ interface FoldResult {
 }
 
 interface SessionPanelState {
+  baseIdentity: string | null
+  stateIdentity: string | null
   ops: Map<string, PanelOperation>
+  invalid: Map<string, string>
   /** Every sourceId ever processed (kept or dropped) — the replay dedup
    * register. `ops` only keeps the ops in the current fold, so a consumed op
    * dropped by a later replace used to be indistinguishable from a first
@@ -89,7 +98,7 @@ const sessions = new Map<string, SessionPanelState>()
 const listeners = new Set<() => void>()
 
 function emptyState(): SessionPanelState {
-  return { ops: new Map(), seen: new Map(), overflow: null, local: null, localBarrier: -1, replayBarrier: -1, maxSeenSeq: -1, snapshot: null }
+  return { baseIdentity: null, stateIdentity: null, ops: new Map(), invalid: new Map(), seen: new Map(), overflow: null, local: null, localBarrier: -1, replayBarrier: -1, maxSeenSeq: -1, snapshot: null }
 }
 
 /* ---------------- localStorage persistence ---------------- */
@@ -103,10 +112,13 @@ const MAX_PERSISTED_SESSIONS = 50
 /** What survives a page reload: the folded snapshot, the local /panel
  * override, and the barriers that keep old replays from resurrecting either. */
 interface PersistedPanel {
+  stateIdentity?: string | null
   snapshot: GenuiSpec | null
   local: GenuiSpec | null
   localBarrier: number
   maxSeenSeq: number
+  /** 未解决的追加项仍需更早历史，不应阻止后续重放。 */
+  pending?: { ops: PanelOperation[]; overflow: PanelOperation | null; replayBarrier: number; baseIdentity: string | null }
 }
 
 interface PanelStorageShape {
@@ -161,7 +173,10 @@ function stateOf(sessionId: string): SessionPanelState {
     const stored = readPanelStorage().sessions[sessionId]
     if (stored !== undefined) {
       state = {
+        baseIdentity: null,
+        stateIdentity: stored.stateIdentity ?? (stored.snapshot == null ? null : fingerprint(JSON.stringify(stored.snapshot))),
         ops: new Map(),
+        invalid: new Map(),
         seen: new Map(),
         overflow: null,
         local: stored.local ?? null,
@@ -169,6 +184,23 @@ function stateOf(sessionId: string): SessionPanelState {
         replayBarrier: stored.maxSeenSeq ?? -1,
         maxSeenSeq: stored.maxSeenSeq ?? -1,
         snapshot: stored.snapshot ?? null,
+      }
+      if (stored.pending !== undefined) {
+        state.baseIdentity = stored.pending.baseIdentity
+        state.ops = new Map(stored.pending.ops.map(op => [op.sourceId, op]))
+        state.seen = new Map(stored.pending.ops.map(op => [op.sourceId, op.order]))
+        state.replayBarrier = stored.pending.replayBarrier
+        const restored = fold(state, null)!
+        state.snapshot = restored.snapshot
+        state.stateIdentity = restored.stateIdentity
+        state.invalid = restored.invalid
+        state.ops = new Map(restored.kept.map(op => [op.sourceId, op]))
+        state.overflow = stored.pending.overflow
+        if (state.overflow !== null) state.seen.set(state.overflow.sourceId, state.overflow.order)
+      } else {
+        // 后续追加项应基于已恢复快照继续处理，不能沿用旧的本地覆盖内容。
+        state.local = state.snapshot
+        state.baseIdentity = state.stateIdentity
       }
     }
   } catch {
@@ -204,6 +236,7 @@ function fold(state: SessionPanelState, extra: PanelOperation | null): FoldResul
   }
   // Only live ops (strictly after both barriers) participate.
   const ops = [...state.ops.values()].filter(op => op.order[0] > state.localBarrier && op.order[0] > state.replayBarrier)
+  if (state.overflow !== null && state.overflow.order[0] > state.localBarrier && state.overflow.order[0] > state.replayBarrier) ops.push(state.overflow)
   if (extra !== null) ops.push(extra)
   ops.sort((a, b) => compareOrder(a.order, b.order))
   // The latest VALID replace resets everything before it; start the fold
@@ -212,18 +245,20 @@ function fold(state: SessionPanelState, extra: PanelOperation | null): FoldResul
   let start = 0
   for (let i = 0; i < ops.length; i++) {
     const op = ops[i]!
-    if (op.mode === 'replace' && countGenuiNodes(op.spec, limits.maxNodes + 1) <= limits.maxNodes) start = i
+    if (op.mode === 'replace' && !exceedsPanelBudget(op.spec)) start = i
   }
   let snapshot: GenuiSpec | null = state.local
+  let stateIdentity = state.baseIdentity
   let overflow: PanelOperation | null = null
   let appendCount = 0
   const kept: PanelOperation[] = []
+  const invalid = new Map<string, string>()
   let maxSeenSeq = state.maxSeenSeq
   for (let i = start; i < ops.length; i++) {
     const op = ops[i]!
     if (op.order[0] > maxSeenSeq) maxSeenSeq = op.order[0]
     if (op.mode === 'replace') {
-      if (countGenuiNodes(op.spec, limits.maxNodes + 1) > limits.maxNodes) {
+      if (exceedsPanelBudget(op.spec)) {
         // Pathological replace beyond the node budget: rejected like any
         // over-budget op (remembered as the overflow barrier, fold kept).
         if (overflow === null || compareOrder(op.order, overflow.order) < 0) overflow = op
@@ -231,6 +266,7 @@ function fold(state: SessionPanelState, extra: PanelOperation | null): FoldResul
       }
       overflow = null
       snapshot = op.spec
+      stateIdentity = fingerprint(JSON.stringify(op.spec))
       kept.length = 0
       appendCount = 0
       kept.push(op)
@@ -240,13 +276,21 @@ function fold(state: SessionPanelState, extra: PanelOperation | null): FoldResul
     // rejection never retroactively drops ops that already fit.
     const merged = mergePanelSpecs(snapshot, op.spec)
     if (appendCount >= limits.maxAppends
-      || countGenuiNodes(merged, limits.maxNodes + 1) > limits.maxNodes) {
+      || exceedsPanelBudget(merged)) {
       if (overflow === null || compareOrder(op.order, overflow.order) < 0) overflow = op
       continue
     }
-    snapshot = merged
     appendCount += 1
     kept.push(op)
+    // 检查完整文档，不单独检查追加增量。暂存未通过检查的操作，供迟到的较早基项重新计算；
+    // 该操作不会改变当前有效内容。
+    const validation = processGenuiSpec(merged)
+    if (validation.errors.length > 0 || validation.spec === null) {
+      invalid.set(op.sourceId, validation.errors.join('；') || 'invalid panel spec')
+      continue
+    }
+    if (snapshot === null) stateIdentity = fingerprint(JSON.stringify(op.spec))
+    snapshot = merged
   }
   if (extra !== null) {
     const sameSet = kept.length === state.ops.size
@@ -255,11 +299,13 @@ function fold(state: SessionPanelState, extra: PanelOperation | null): FoldResul
         || (overflow !== null && state.overflow !== null && overflow.sourceId === state.overflow.sourceId))
     if (sameSet) return null
   }
-  return { snapshot, kept, overflow, maxSeenSeq }
+  return { snapshot, stateIdentity, kept, invalid, overflow, maxSeenSeq }
 }
 
 function commit(state: SessionPanelState, result: FoldResult, sessionId: string): void {
   state.snapshot = result.snapshot
+  state.stateIdentity = result.stateIdentity
+  state.invalid = result.invalid
   state.overflow = result.overflow
   state.maxSeenSeq = result.maxSeenSeq
   state.ops = new Map(result.kept.map(op => [op.sourceId, op]))
@@ -269,14 +315,18 @@ function commit(state: SessionPanelState, result: FoldResult, sessionId: string)
   for (const op of result.kept) state.seen.set(op.sourceId, op.order)
   if (result.overflow !== null) state.seen.set(result.overflow.sourceId, result.overflow.order)
   writePanelStorage(sessionId, {
+    stateIdentity: state.stateIdentity,
     snapshot: state.snapshot,
     local: state.local,
     localBarrier: state.localBarrier,
     maxSeenSeq: state.maxSeenSeq,
+    ...(state.invalid.size === 0 ? {} : { pending: {
+      ops: [...state.ops.values()], overflow: state.overflow, replayBarrier: state.replayBarrier, baseIdentity: state.baseIdentity,
+    } }),
   })
 }
 
-export type PanelOperationStatus = 'accepted' | 'idempotent' | 'blocked' | 'overflow'
+export type PanelOperationStatus = 'accepted' | 'idempotent' | 'blocked' | 'overflow' | 'invalid'
 
 /**
  * Submit one panel operation. Idempotent per sourceId; ordering and budget
@@ -299,8 +349,9 @@ export function applyPanelOperation(sessionId: string, op: PanelOperation): Pane
   }
   const status: PanelOperationStatus = result.overflow !== null && result.overflow.sourceId === op.sourceId
     ? 'overflow'
-    : 'accepted'
-  const changed = state.snapshot !== result.snapshot
+    : result.invalid.has(op.sourceId) ? 'invalid' : 'accepted'
+  const changed = state.snapshot !== result.snapshot || state.invalid.size !== result.invalid.size
+    || [...result.invalid].some(([sourceId, error]) => state.invalid.get(sourceId) !== error)
   commit(state, result, sessionId)
   if (changed) for (const fn of listeners) fn()
   return status
@@ -344,6 +395,7 @@ export function setLocalPanel(sessionId: string, spec: GenuiSpec | null): void {
   // moves: the barrier is what kills old history replays.
   if (state.local === spec && state.localBarrier === barrier) return
   state.local = spec
+  state.baseIdentity = spec === null ? null : fingerprint(JSON.stringify(spec))
   state.localBarrier = barrier
   // extra is null here, so fold never rejects the candidate (its null
   // returns live behind the `extra !== null` gate).
@@ -361,7 +413,7 @@ export function diagnosePanelBudget(sessionId: string, sourceId: string): void {
   if (diagnosedOverflow.has(key)) return
   diagnosedOverflow.add(key)
   console.warn(
-    `[genui] 面板已到节点/操作上限（${limits.maxNodes} 节点、${limits.maxAppends} 条追加），本次 append 被拒绝；请让模型发送 replace 更新面板。`,
+    `[genui] 面板已到内容/操作上限（${limits.maxNodes} 节点、${GENUI_LIMITS.maxComputedFields} 个计算字段、${limits.maxAppends} 条追加），本次 append 被拒绝；请让模型发送 replace 更新面板。`,
   )
 }
 
@@ -395,6 +447,17 @@ export function getPanelSpec(sessionId: string): GenuiSpec | null {
   return stateOf(sessionId).snapshot
 }
 
+/** 返回面板状态标识；追加沿用基项标识，替换操作使用自身内容标识。 */
+export function getPanelStateKey(sessionId: string): string | undefined {
+  const identity = stateOf(sessionId).stateIdentity
+  return identity === null ? undefined : `p:${sessionId}:${identity}`
+}
+
+/** 返回追加操作的当前错误；较早操作解决依赖后会清除错误。 */
+export function getPanelOperationError(sessionId: string, sourceId: string): string | null {
+  return stateOf(sessionId).invalid.get(sourceId) ?? null
+}
+
 /** Subscribe to panel changes. Returns the disposer. */
 export function subscribePanel(listener: () => void): () => void {
   listeners.add(listener)
@@ -405,38 +468,10 @@ export function subscribePanel(listener: () => void): () => void {
 
 /* ---------------- incremental append (pure merge) ---------------- */
 
-/** If `spec` is a single root `tabs` node, its tabs; otherwise null. */
-function asTabs(spec: GenuiSpec): GenuiTab[] | null {
-  if (spec.items.length !== 1) return null
-  const only = spec.items[0]
-  if (only?.type !== 'tabs' || !Array.isArray(only.tabs)) return null
-  return only.tabs
-}
-
-/**
- * Merge an `append` spec into the current panel spec:
- * - both sides single-tabs containers → merge BY TAB LABEL: items of
- *   same-labelled tabs are appended, new labels are added (order preserved);
- * - otherwise → plain item lists are appended to the tail.
- * The previous title wins unless it was absent. `next` is returned as-is when
- * there is nothing to merge into. Export for tests.
- */
-export function mergePanelSpecs(prev: GenuiSpec | null, next: GenuiSpec): GenuiSpec {
-  if (prev === null || prev.items.length === 0) return next
-  const title = prev.title ?? next.title
-  const base = { ...prev, ...(title === undefined ? {} : { title }) }
-  const prevTabs = asTabs(prev)
-  const nextTabs = asTabs(next)
-  if (prevTabs !== null && nextTabs !== null) {
-    const merged = new Map(prevTabs.map(t => [t.label, { label: t.label, items: [...t.items] }]))
-    for (const tab of nextTabs) {
-      const existing = merged.get(tab.label)
-      if (existing !== undefined) existing.items.push(...tab.items)
-      else merged.set(tab.label, { label: tab.label, items: [...tab.items] })
-    }
-    return { ...base, items: [{ type: 'tabs', tabs: [...merged.values()] }] }
-  }
-  return { ...base, items: [...prev.items, ...next.items] }
+/** 合并后的面板仍须遵守单份规格的节点和计算字段预算。 */
+function exceedsPanelBudget(spec: GenuiSpec): boolean {
+  return countGenuiNodes(spec, limits.maxNodes + 1) > limits.maxNodes
+    || (spec.computed?.length ?? 0) > GENUI_LIMITS.maxComputedFields
 }
 
 /* ---------------- expand requests ---------------- */
